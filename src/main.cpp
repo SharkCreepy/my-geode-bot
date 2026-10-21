@@ -10,15 +10,15 @@ bool g_noclipEnabled = false;
 bool g_autoClickerEnabled = false;
 bool g_layoutModeEnabled = false;
 
-// --- Custom Draggable Button (Now with a proper hitbox) ---
+// --- Custom Draggable Button (Foolproof Version) ---
 class DraggableButton : public CCNode, public cocos2d::CCTargetedTouchDelegate {
 protected:
     bool m_isDragging = false;
     CCPoint m_startPos;
     CCPoint m_startTouch;
-    CCMenuItemSpriteExtra* m_button;
     CCObject* m_target;
     SEL_MenuHandler m_selector;
+    CCMenuItemSpriteExtra* m_button;
 
 public:
     bool init(CCNode* normalSprite, CCObject* target, SEL_MenuHandler selector) {
@@ -29,16 +29,15 @@ public:
 
         // Create the visual button
         m_button = CCMenuItemSpriteExtra::create(normalSprite, nullptr, target, selector);
+        m_button->setPosition({22.5f, 22.5f}); 
         this->addChild(m_button);
         
-        // FIX 1: Give the DraggableButton a real hitbox based on the sprite
-        this->setContentSize(m_button->getContentSize());
-        // FIX 2: Set anchor to center so dragging is smooth and accurate
+        // Hardcode the size to 45x45 (matching your background sprite)
+        this->setContentSize({45.f, 45.f});
         this->setAnchorPoint({0.5f, 0.5f});
-        m_button->setPosition(this->getContentSize() / 2);
 
-        // Register touches
-        CCTouchDispatcher::get()->addTargetedDelegate(this, 0, true);
+        // FIX 1: Set priority to -502 (higher than the game's touch priority)
+        CCTouchDispatcher::get()->addTargetedDelegate(this, -502, true);
 
         return true;
     }
@@ -50,9 +49,12 @@ public:
 
     bool ccTouchBegan(CCTouch* touch, CCEvent* event) override {
         auto location = touch->getLocation();
+        // Convert the screen touch to our button's local coordinates
+        auto local = this->convertToNodeSpace(location);
+        auto size = this->getContentSize();
         
-        // Use boundingBox to check if touch is inside our 45x45 square
-        if (this->boundingBox().containsPoint(location)) {
+        // Check if the touch is inside our 45x45 box
+        if (local.x >= 0 && local.x <= size.width && local.y >= 0 && local.y <= size.height) {
             m_startPos = this->getPosition();
             m_startTouch = location;
             m_isDragging = false;
@@ -72,6 +74,7 @@ public:
         if (m_isDragging) {
             auto newPos = m_startPos + diff;
             auto winSize = CCDirector::sharedDirector()->getWinSize();
+            // Keep it on screen
             newPos.x = std::clamp(newPos.x, 25.f, winSize.width - 25.f);
             newPos.y = std::clamp(newPos.y, 25.f, winSize.height - 25.f);
             this->setPosition(newPos);
@@ -80,9 +83,9 @@ public:
 
     void ccTouchEnded(CCTouch* touch, CCEvent* event) override {
         if (m_isDragging) {
-            m_isDragging = false;
+            m_isDragging = false; // Stop dragging, do not click
         } else {
-            // FIX 3: Manually trigger the target function to guarantee the menu opens
+            // Manually trigger the menu open function
             if (m_target && m_selector) {
                 (m_target->*m_selector)(this);
             }
@@ -186,10 +189,15 @@ class $modify(MyPlayLayer, PlayLayer) {
         auto menuBtn = DraggableButton::create(bg, this, menu_selector(MyPlayLayer::onOpenMenu));
         
         auto winSize = CCDirector::sharedDirector()->getWinSize();
-        // Position it top-left (because anchor is now center, this places it perfectly)
         menuBtn->setPosition({40.f, winSize.height - 40.f});
         
-        this->addChild(menuBtn, 9999); 
+        // FIX 2: Add the button to the absolute top-level scene so PlayLayer can't hide or block it
+        auto runningScene = CCDirector::sharedDirector()->getRunningScene();
+        if (runningScene) {
+            runningScene->addChild(menuBtn, 999999); 
+        } else {
+            this->addChild(menuBtn, 999999);
+        }
 
         return true;
     }
