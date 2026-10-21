@@ -9,11 +9,12 @@
 #include <cmath>
 #include <vector>
 #include <string>
+#include <unordered_map>
 
 using namespace geode::prelude;
 
 // ===============================================================
-// Shared state (cached in memory, saved to disk when changed)
+// Shared state
 // ===============================================================
 #if defined(GEODE_IS_ANDROID) || defined(GEODE_IS_IOS)
 constexpr float DEFAULT_HUD_SCALE = 1.3f;
@@ -85,7 +86,7 @@ class $modify(SpeedScheduler, CCScheduler) {
 };
 
 // ===============================================================
-// Simplified cube physics simulator
+// Cube physics simulator
 // ===============================================================
 namespace sim {
     enum Kind : int {
@@ -96,7 +97,7 @@ namespace sim {
         KindCount
     };
 
-    struct Box { float x0, y0, x1, y1; int kind; };
+    struct Box { float x0, y0, x1, y1; int kind; GameObject* src = nullptr; };
 
     inline std::vector<Box> boxes;
     inline std::vector<Box> wide;
@@ -118,7 +119,7 @@ namespace sim {
     inline float launch[KindCount] = {
         0.f, 0.f, 0.f, 0.f,
         1.43f, 0.93f, 1.79f, -0.9f,
-        1.00f, 0.68f, 1.30f, -0.3f, -0.9f
+        1.00f, 0.68f, 1.30f, -1.1f, -1.3f
     };
 
     struct S {
@@ -271,7 +272,7 @@ namespace sim {
     }
 
     inline int horizon(float vx) {
-        return std::clamp(static_cast<int>(450.f / std::max(vx, 1.f)), 40, 110);
+        return std::clamp(static_cast<int>(900.f / std::max(vx, 1.f)), 60, 170);
     }
 
     inline int deathFrame(S s, float vx, int H) {
@@ -340,6 +341,74 @@ namespace sim {
             return false;
         }
     };
+}
+
+// ===============================================================
+// Wave physics (45° movement, click toggles vertical direction)
+// ===============================================================
+namespace waveSim {
+    constexpr float HALF = sim::HALF;
+    constexpr float HAZ_HALF = sim::HAZ_HALF;
+
+    struct S {
+        float x = 0.f, y = 0.f;
+        int dir = +1;
+        bool dead = false;
+    };
+
+    inline void step(S& s, float vx, bool click) {
+        if (s.dead) return;
+        if (click) s.dir = -s.dir;
+        s.x += vx;
+        s.y += s.dir * vx;
+
+        if (s.y - HALF < sim::floorY) { s.dead = true; return; }
+        if (s.y + HALF > sim::ceilY)  { s.dead = true; return; }
+
+        sim::forEachNear(s.x, [&](sim::Box const& b) {
+            if (s.dead) return;
+            if (b.kind == sim::Hazard) {
+                if (sim::overlap(s.x, s.y, HAZ_HALF, b)) s.dead = true;
+            } else if (b.kind == sim::Solid) {
+                if (sim::overlap(s.x, s.y, HALF, b)) s.dead = true;
+            }
+        });
+    }
+
+    inline bool dfs(S s, float vx, int H, int clicksLeft, int& budget, bool& clickNow) {
+        if (s.dead) return false;
+        if (H == 0) { clickNow = false; return true; }
+        if (--budget <= 0) return false;
+
+        S n = s;
+        step(n, vx, false);
+        if (!n.dead) {
+            bool c;
+            if (dfs(n, vx, H - 1, clicksLeft, budget, c)) { clickNow = false; return true; }
+        }
+
+        if (clicksLeft > 0) {
+            S c = s;
+            step(c, vx, true);
+            if (!c.dead) {
+                bool c2;
+                if (dfs(c, vx, H - 1, clicksLeft - 1, budget, c2)) { clickNow = true; return true; }
+            }
+        }
+        return false;
+    }
+
+    inline bool plan(S s, float vx, int H, int maxClicks, bool& clickNow) {
+        for (int clicks = 0; clicks <= maxClicks; clicks++) {
+            int budget = 4000;
+            bool cn = false;
+            if (dfs(s, vx, H, clicks, budget, cn)) {
+                clickNow = cn;
+                return true;
+            }
+        }
+        return false;
+    }
 }
 
 $on_mod(Loaded) {
@@ -695,6 +764,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool botHolding = false;
         bool havePlan = false;
         float planX = 0.f;
+        float planDeadlineX = 0.f;
+        int planIdle = 0;
         int cooldown = 0;
         int retry = 0;
         int lockIdx = -1;
@@ -702,20 +773,17 @@ class $modify(BotPlayLayer, PlayLayer) {
         std::string lastStatus;
     };
 
-    // FIX: geometric local-ground check (works for both gravity directions).
     bool isOnLocalGround(float x, float y, bool flip) {
         float up = flip ? -1.f : 1.f;
         float ly = y * up;
         float floorL = flip ? -sim::ceilY : sim::floorY;
 
-        // Floor / ceiling boundary
         if (std::abs((ly - sim::HALF) - floorL) < 1.5f) return true;
 
-        // Top face of a solid block
         bool onBlock = false;
         sim::forEachNear(x, [&](sim::Box const& b) {
             if (b.kind != sim::Solid) return;
-            float by1 = flip ? -b.y0 : b.y1;    // block top in local frame
+            float by1 = flip ? -b.y0 : b.y1;
             if (x + sim::HALF > b.x0 && x - sim::HALF < b.x1 &&
                 std::abs((ly - sim::HALF) - by1) < 1.5f) onBlock = true;
         });
@@ -790,6 +858,11 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     void buildGeometry() {
+        std::unordered_map<GameObject*, std::pair<float,float>> oldPos;
+        for (auto const& b : sim::boxes) {
+            if (b.src) oldPos[b.src] = {b.x0, b.y0};
+        }
+
         sim::boxes.clear();
         sim::wide.clear();
         sim::maxW = 30.f;
@@ -848,7 +921,20 @@ class $modify(BotPlayLayer, PlayLayer) {
             }
             if (r.size.width <= 0.f || r.size.height <= 0.f) continue;
 
-            sim::Box b{r.origin.x, r.origin.y, r.origin.x + r.size.width, r.origin.y + r.size.height, kind};
+            bool isDynamic = false;
+            auto oit = oldPos.find(obj);
+            if (oit != oldPos.end()) {
+                if (std::abs(oit->second.first  - r.origin.x) > 0.5f ||
+                    std::abs(oit->second.second - r.origin.y) > 0.5f) {
+                    isDynamic = true;
+                }
+            }
+            if (isDynamic && (kind == sim::Solid || kind == sim::Hazard)) {
+                continue;
+            }
+
+            sim::Box b{r.origin.x, r.origin.y, r.origin.x + r.size.width,
+                       r.origin.y + r.size.height, kind, obj};
             bool isWide = r.size.width > 120.f && (kind == sim::Solid || kind == sim::Hazard);
             if (isWide) {
                 sim::wide.push_back(b);
@@ -892,6 +978,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->botHolding = false;
         f->botRelease = 0;
         f->havePlan = false;
+        f->planIdle = 0;
         f->cooldown = 0;
         f->retry = 0;
         f->lockIdx = -1;
@@ -915,10 +1002,11 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->ticks++;
 
         if ((!f->geometryBuilt && m_objects && m_objects->count() > 0) ||
-            f->ticks == 20 || f->needRebuild) {
+            f->ticks == 20 || f->needRebuild || (f->ticks % 30 == 0 && f->geometryBuilt)) {
             f->geometryBuilt = true;
             f->needRebuild = false;
             this->buildGeometry();
+            f->lockIdx = -1;
         }
 
         this->updateHud();
@@ -951,7 +1039,8 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         std::string msg;
         if (!m_player1) msg = "no player";
-        else if (!this->cubeMode()) msg = "Not in cube mode (bot + trajectory are cube only)";
+        else if (this->waveMode()) msg = "Wave mode (bot active)";
+        else if (!this->cubeMode()) msg = "Unsupported gamemode (cube + wave only)";
         else if (sim::boxes.empty() && sim::wide.empty()) msg = "No level geometry found";
         else msg = fmt::format("S{} H{} P{} O{} G{} | jump {:.2f}/{:.3f} | {}",
                                sim::nSolid, sim::nHazard, sim::nPad, sim::nOrb, sim::nPortal,
@@ -1016,7 +1105,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         this->learnLaunch();
     }
 
-    // FIX: use geometric local ground for stepPrevGround (works with flipped gravity).
     void learnLaunch() {
         auto f = m_fields.self();
         if (!m_player1 || sim::boxes.empty()) return;
@@ -1038,7 +1126,7 @@ class $modify(BotPlayLayer, PlayLayer) {
             });
 
             auto m = Mod::get();
-            if (launcher >= 0 && (sim::isPad(launcher) || !f->stepPrevGround)) {
+            if (launcher >= 0) {
                 float mult = (absV * (flip ? -1.f : 1.f)) / sim::jumpVel;
                 if (std::abs(mult) > 0.1f && std::abs(mult) < 3.5f) {
                     sim::launch[launcher] += (mult - sim::launch[launcher]) * 0.5f;
@@ -1194,9 +1282,11 @@ class $modify(BotPlayLayer, PlayLayer) {
                !p->m_isDart && !p->m_isRobot && !p->m_isSpider && !p->m_isSwing;
     }
 
-    // FIX: gravity-agnostic ground detection. Uses geometric local-ground, falls
-    // back to the game's own m_isOnGround. Learns ceilY / floorY from any ground
-    // contact, so the sim stays accurate when flipped.
+    bool waveMode() {
+        auto p = m_player1;
+        return p && !p->m_isDead && p->m_isDart;
+    }
+
     sim::S currentSimState() {
         auto f = m_fields.self();
         sim::S s;
@@ -1208,8 +1298,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         s.dead = false;
         s.lock = -1;
 
-        // Geometric check first (works for both gravity directions),
-        // then OR with the game's own flag as a safety net.
         s.ground = this->isOnLocalGround(s.x, s.y, flip) || m_player1->m_isOnGround;
         s.vy = s.ground ? 0.f : f->vy * up;
 
@@ -1231,7 +1319,6 @@ class $modify(BotPlayLayer, PlayLayer) {
             if (found >= 0) s.lock = found;
         }
 
-        // Learn floor / ceiling from any grounded state where we're not on a block.
         if (s.ground) {
             bool onBlock = false;
             float ly = s.y * up;
@@ -1251,6 +1338,8 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     void drawTrajectory() {
+        if (this->waveMode()) { this->drawWaveTrajectory(); return; }
+
         auto f = m_fields.self();
         if (!f->traj) return;
         f->traj->clear();
@@ -1262,26 +1351,68 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto drawPath = [&](bool press, ccColor4F col) {
             auto s = start;
             auto prev = CCPoint{s.x, s.y};
+            CCPoint end = prev;
+            bool died = false;
+
             for (int i = 0; i < H; i++) {
                 sim::step(s, f->vx, press && i == 0);
-                if (i % 3 == 2 || s.dead) {
-                    CCPoint p{s.x, s.y};
-                    f->traj->drawSegment(prev, p, 1.2f, col);
-                    prev = p;
+                CCPoint p{s.x, s.y};
+                if ((i & 1) == 0 || s.dead) {
+                    f->traj->drawSegment(prev, p, 1.4f, col);
                 }
-                if (s.dead) {
-                    f->traj->drawDot(prev, 4.f, ccc4f(1.f, 0.f, 0.f, 1.f));
-                    break;
-                }
+                prev = p;
+                end = p;
+                if (s.dead) { died = true; break; }
             }
+
+            ccColor4F markCol = died
+                ? ccc4f(1.f, 0.2f, 0.2f, 1.f)
+                : ccc4f(col.r, col.g, col.b, 0.85f);
+            f->traj->drawDot(end, 5.f, markCol);
         };
 
         drawPath(false, ccc4f(1.f, 0.4f, 0.4f, 0.9f));
-        if (sim::canAct(start)) drawPath(true, ccc4f(0.3f, 1.f, 0.4f, 0.9f));
+        if (sim::canAct(start)) {
+            drawPath(true, ccc4f(0.3f, 1.f, 0.4f, 0.9f));
+        }
     }
 
-    // FIX: press with a caller-controlled cooldown so the desperation branch
-    // can't spam multiple useless clicks before the real jump.
+    void drawWaveTrajectory() {
+        auto f = m_fields.self();
+        if (!f->traj) return;
+        f->traj->clear();
+        if (!g.trajectory) return;
+
+        waveSim::S s;
+        s.x = m_player1->getPositionX();
+        s.y = m_player1->getPositionY();
+        s.dir = (f->vy >= 0.f) ? +1 : -1;
+        s.dead = false;
+
+        int H = sim::horizon(f->vx);
+
+        auto path = [&](bool clickNow, ccColor4F col) {
+            waveSim::S w = s;
+            auto prev = CCPoint{w.x, w.y};
+            waveSim::step(w, f->vx, clickNow);
+            for (int i = 0; i < H - 1; i++) {
+                CCPoint p{w.x, w.y};
+                if ((i & 1) == 0 || w.dead) {
+                    f->traj->drawSegment(prev, p, 1.4f, col);
+                }
+                prev = p;
+                if (w.dead) break;
+                waveSim::step(w, f->vx, false);
+            }
+            f->traj->drawDot(prev, 5.f,
+                w.dead ? ccc4f(1.f, 0.2f, 0.2f, 1.f)
+                       : ccc4f(col.r, col.g, col.b, 0.85f));
+        };
+
+        path(false, ccc4f(1.f, 0.4f, 0.4f, 0.9f));
+        path(true,  ccc4f(0.3f, 1.f, 0.4f, 0.9f));
+    }
+
     void botPress(sim::S const& s, int cooldown = 3) {
         auto f = m_fields.self();
         if (!s.ground) {
@@ -1294,10 +1425,17 @@ class $modify(BotPlayLayer, PlayLayer) {
         this->pressJump(true);
     }
 
-    // FIX: aim for the LATEST safe frame (last - 1, clamped to the window) so
-    // the jump fires as late as possible. And do NOT press at first==0 unless
-    // the window is actually about to close.
+    void wavePress() {
+        auto f = m_fields.self();
+        f->botHolding = true;
+        f->botRelease = 1;
+        f->cooldown = 1;
+        this->pressJump(true);
+    }
+
     void tickBot() {
+        if (this->waveMode()) { this->tickWaveBot(); return; }
+
         auto f = m_fields.self();
 
         if (f->botRelease > 0 && --f->botRelease == 0) {
@@ -1314,17 +1452,24 @@ class $modify(BotPlayLayer, PlayLayer) {
         p.vx = f->vx;
         p.H = sim::horizon(p.vx);
 
-        if (f->havePlan && f->planX < s.x - 2.f * p.vx) f->havePlan = false;
-
         bool act = sim::canAct(s);
         int d = sim::deathFrame(s, p.vx, p.H);
 
         if (f->havePlan) {
             if (d < 0) {
-                f->havePlan = false;
-            } else if (act && s.x + p.vx * 0.5f >= f->planX) {
-                this->botPress(s);
+                if (++f->planIdle > 4) f->havePlan = false;
+            } else {
+                f->planIdle = 0;
             }
+
+            bool reachAim = act && s.x + p.vx * 0.5f >= f->planX;
+            bool deadline = act && s.x + p.vx * 0.5f >= f->planDeadlineX;
+            if (reachAim || deadline) {
+                this->botPress(s);
+                return;
+            }
+
+            if (s.x > f->planDeadlineX + p.vx * 4.f) f->havePlan = false;
             return;
         }
 
@@ -1340,7 +1485,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                 if (sim::canAct(w) && (extra == 0 || (k & 1) == 0)) {
                     auto j = w;
                     sim::step(j, p.vx, true);
-                    p.budget = extra == 0 ? 3000 : 6000;
+                    p.budget = extra == 0 ? 5000 : 8000;
                     bool ok = !j.dead && p.survive(j, 1, extra);
                     if (ok) {
                         if (runFirst < 0) runFirst = k;
@@ -1360,27 +1505,76 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (first < 0) scan(2, first, last);
 
         if (first < 0) {
-            // No safe window: only press if we're grounded or next to an orb,
-            // and use a long cooldown so we don't spam multiple "useless clicks".
-            if (act && d <= 5) this->botPress(s, 10);
+            if (act && d <= 4) this->botPress(s, 12);
             else f->retry = 2;
             return;
         }
 
-        // Aim near the END of the safe window (latest possible press), clamped
-        // to [first, last] so narrow windows still get the correct frame.
-        int aimFrame = std::max(first, last - 1);
-        float aimX = s.x + p.vx * aimFrame;
+        float firstX = s.x + p.vx * first;
+        float lastX  = s.x + p.vx * last;
+        float aimX = lastX - p.vx * 1.0f;
+        if (aimX < firstX) aimX = firstX;
 
-        bool mustPress = (first == 0 && last <= 1);
-        bool reachedAim = act && s.x + p.vx * 0.5f >= aimX;
-
-        if (mustPress || reachedAim) {
+        if (first == 0 && last <= 1) {
             this->botPress(s);
             return;
         }
+        if (act && s.x + p.vx * 0.5f >= aimX) {
+            this->botPress(s);
+            return;
+        }
+
         f->havePlan = true;
         f->planX = aimX;
+        f->planDeadlineX = lastX + p.vx * 0.5f;
+        f->planIdle = 0;
+    }
+
+    void tickWaveBot() {
+        auto f = m_fields.self();
+
+        if (f->botRelease > 0 && --f->botRelease == 0) {
+            f->botHolding = false;
+            this->pressJump(false);
+        }
+        if (f->cooldown > 0) f->cooldown--;
+
+        if (!this->waveMode()) return;
+        if (sim::boxes.empty() && sim::wide.empty()) return;
+        if (f->botHolding || f->cooldown > 0) return;
+
+        waveSim::S s;
+        s.x = m_player1->getPositionX();
+        s.y = m_player1->getPositionY();
+        s.dir = (f->vy >= 0.f) ? +1 : -1;
+        s.dead = false;
+
+        constexpr int H = 30;
+        {
+            waveSim::S probe = s;
+            bool dies = false;
+            for (int i = 0; i < H; i++) {
+                waveSim::step(probe, f->vx, false);
+                if (probe.dead) { dies = true; break; }
+            }
+            if (!dies) return;
+        }
+
+        {
+            waveSim::S probe = s;
+            waveSim::step(probe, f->vx, true);
+            bool dies = probe.dead;
+            for (int i = 1; i < H && !dies; i++) {
+                waveSim::step(probe, f->vx, false);
+                if (probe.dead) dies = true;
+            }
+            if (!dies) { this->wavePress(); return; }
+        }
+
+        bool clickNow = false;
+        if (waveSim::plan(s, f->vx, 40, 3, clickNow) && clickNow) {
+            this->wavePress();
+        }
     }
 
     void applyLayoutMode(bool enable) {
@@ -1422,4 +1616,3 @@ class $modify(StepPlayer, PlayerObject) {
         PlayerObject::update(dt);
     }
 };
-
