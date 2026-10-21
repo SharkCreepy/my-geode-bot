@@ -20,6 +20,14 @@ constexpr float DEFAULT_HUD_SCALE = 1.3f;
 constexpr float DEFAULT_HUD_SCALE = 1.0f;
 #endif
 
+// Draw what the bot "sees" (cyan = solid, red = hazard, yellow = slope, purple = orb/pad/portal)
+// whenever Trajectory is on. Set to false once everything looks right.
+constexpr bool SHOW_SIM_BOXES = true;
+// Which corner holds the right angle on an unrotated, unflipped slope:
+// 0 = bottom-left, 1 = bottom-right, 2 = top-left, 3 = top-right.
+// If the yellow debug triangles look mirrored, change this.
+constexpr int SLOPE_BASE_CORNER = 1;
+
 struct State {
     bool noclip = false;
     bool counter = false;
@@ -89,17 +97,18 @@ namespace sim {
         PortalNormal, PortalInverse,
         PadYellow, PadPink, PadRed, PadBlue,
         OrbYellow, OrbPink, OrbRed, OrbBlue, OrbGreen,
+        Slope,
         KindCount
     };
 
-    struct Box { float x0, y0, x1, y1; int kind; GameObject* src = nullptr; };
+    struct Box { float x0, y0, x1, y1; int kind; GameObject* src = nullptr; int corner = 0; };
 
     inline std::vector<Box> boxes;
     inline std::vector<Box> wide;
     inline float maxW = 30.f;
     inline float floorY = 90.f;
     inline float ceilY = 600.f; // Give a little extra headroom
-    inline int nSolid = 0, nHazard = 0, nPad = 0, nOrb = 0, nPortal = 0;
+    inline int nSolid = 0, nHazard = 0, nPad = 0, nOrb = 0, nPortal = 0, nSlope = 0;
 
     constexpr float HALF = 15.f;
     constexpr float HAZ_HALF = 11.f; // Slightly forgiving spike hitbox
@@ -133,6 +142,16 @@ namespace sim {
 
     inline bool overlap(float x, float y, float h, Box const& b) {
         return x + h > b.x0 && x - h < b.x1 && y + h > b.y0 && y - h < b.y1;
+    }
+
+    // Right-triangle slope: b is the bounding box, b.corner (bit0 = right, bit1 = top) is the right-angle corner.
+    inline bool slopeOverlap(float x, float y, float h, Box const& b) {
+        if (!overlap(x, y, h, b)) return false;
+        float W = std::max(b.x1 - b.x0, 1.f), H = std::max(b.y1 - b.y0, 1.f);
+        bool right = (b.corner & 1) != 0, top = (b.corner & 2) != 0;
+        float u = std::max(right ? (b.x1 - (x + h)) : ((x - h) - b.x0), 0.f);
+        float v = std::max(top   ? (b.y1 - (y + h)) : ((y - h) - b.y0), 0.f);
+        return u / W + v / H < 1.f;
     }
 
     inline std::vector<Box>::iterator firstNear(float x) {
@@ -353,6 +372,8 @@ namespace waveSim {
                     if (sim::overlap(s.x, s.y, HAZ_HALF, b)) s.dead = true;
                 } else if (b.kind == sim::Solid) {
                     if (sim::overlap(s.x, s.y, HALF, b)) s.dead = true;
+                } else if (b.kind == sim::Slope) {
+                    if (sim::slopeOverlap(s.x, s.y, HALF, b)) s.dead = true;
                 }
             });
         }
@@ -707,6 +728,20 @@ public:
 // ===============================================================
 // PlayLayer hook
 // ===============================================================
+// Corner of the slope's bounding box that holds the right angle (bit0 = right, bit1 = top).
+// -1 = rotated by something that isn't a multiple of 90 degrees (skipped).
+static int slopeCorner(GameObject* obj) {
+    float q90 = obj->getRotation() / 90.f;
+    if (std::abs(q90 - std::round(q90)) > 0.03f) return -1;
+    int cx = SLOPE_BASE_CORNER & 1, cy = (SLOPE_BASE_CORNER >> 1) & 1;
+    if (obj->isFlipX()) cx = 1 - cx;
+    if (obj->isFlipY()) cy = 1 - cy;
+    int q = static_cast<int>(std::lround(q90)) % 4;
+    if (q < 0) q += 4;
+    for (int i = 0; i < q; i++) { int ncx = cy; int ncy = 1 - cx; cx = ncx; cy = ncy; }
+    return cx | (cy << 1);
+}
+
 class $modify(BotPlayLayer, PlayLayer) {
     struct Fields {
         bool prevLayout = false;
@@ -866,7 +901,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         sim::wide.clear();
         sim::maxW = 30.f;
         sim::floorY = 90.f;
-        sim::nSolid = sim::nHazard = sim::nPad = sim::nOrb = sim::nPortal = 0;
+        sim::nSolid = sim::nHazard = sim::nPad = sim::nOrb = sim::nPortal = sim::nSlope = 0;
         if (!m_objects) return;
 
         float px = m_player1 ? m_player1->getPositionX() : 0.f;
@@ -878,8 +913,6 @@ class $modify(BotPlayLayer, PlayLayer) {
 
             auto pos = obj->getPosition();
             if (pos.x < winX0 || pos.x > winX1) continue;
-
-            if (obj->m_objectType == GameObjectType::Slope) continue;
 
             int kind = -1;
             switch (obj->m_objectID) {
@@ -897,6 +930,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                     else if (obj->m_objectType == GameObjectType::Solid) kind = sim::Solid;
                     else if (obj->m_objectType == GameObjectType::InverseGravityPortal) kind = sim::PortalInverse;
                     else if (obj->m_objectType == GameObjectType::NormalGravityPortal) kind = sim::PortalNormal;
+                    else if (obj->m_objectType == GameObjectType::Slope) kind = sim::Slope;
             }
             if (kind < 0) continue;
 
@@ -951,6 +985,11 @@ class $modify(BotPlayLayer, PlayLayer) {
 
             sim::Box b{r.origin.x, r.origin.y, r.origin.x + r.size.width,
                        r.origin.y + r.size.height, kind, obj};
+            if (kind == sim::Slope) {
+                int c = slopeCorner(obj);
+                if (c < 0) continue;
+                b.corner = c;
+            }
             bool isWide = r.size.width > 120.f && (kind == sim::Solid || kind == sim::Hazard);
             if (isWide) {
                 sim::wide.push_back(b);
@@ -963,6 +1002,7 @@ class $modify(BotPlayLayer, PlayLayer) {
             else if (kind == sim::Hazard) sim::nHazard++;
             else if (sim::isPad(kind)) sim::nPad++;
             else if (sim::isPortal(kind)) sim::nPortal++;
+            else if (kind == sim::Slope) sim::nSlope++;
             else sim::nOrb++;
         }
         std::sort(sim::boxes.begin(), sim::boxes.end(),
@@ -1074,11 +1114,11 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         std::string msg;
         if (!m_player1) msg = "no player";
-        else if (this->waveMode()) msg = "Wave mode (bot active)";
+        else if (this->waveMode()) msg = fmt::format("Wave | S{} H{} L{} | {} v3", sim::nSolid, sim::nHazard, sim::nSlope, g.bot ? "bot" : "traj");
         else if (!this->cubeMode()) msg = "Unsupported gamemode (cube + wave only)";
         else if (sim::boxes.empty() && sim::wide.empty()) msg = "No level geometry found";
-        else msg = fmt::format("S{} H{} P{} O{} G{} | jump {:.2f}/{:.3f} | {}",
-                               sim::nSolid, sim::nHazard, sim::nPad, sim::nOrb, sim::nPortal,
+        else msg = fmt::format("S{} H{} L{} P{} O{} G{} | jump {:.2f}/{:.3f} | {} v3",
+                               sim::nSolid, sim::nHazard, sim::nSlope, sim::nPad, sim::nOrb, sim::nPortal,
                                sim::jumpVel, sim::grav, g.bot ? "bot" : "traj");
 
         if (msg != f->lastStatus) {
@@ -1301,6 +1341,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->trajCounter = 0;
         f->trajDirty = false;
         f->traj->clear();
+        if (SHOW_SIM_BOXES) this->drawSimBoxes();
 
         if (isWave) {
             this->drawWaveTrajectoryBody();
@@ -1308,6 +1349,37 @@ class $modify(BotPlayLayer, PlayLayer) {
             auto start = this->currentSimState();
             this->drawCubeTrajectoryBody(start);
         }
+    }
+
+    void drawSimBoxes() {
+        auto f = m_fields.self();
+        if (!m_player1) return;
+        float px = m_player1->getPositionX();
+        auto draw = [&](sim::Box const& b) {
+            if (b.x1 < px - 120.f || b.x0 > px + 500.f) return;
+            ccColor4F col = ccc4f(0.2f, 0.8f, 1.f, 0.8f);
+            if (b.kind == sim::Hazard) col = ccc4f(1.f, 0.2f, 0.2f, 0.9f);
+            else if (b.kind == sim::Slope) col = ccc4f(1.f, 1.f, 0.2f, 0.9f);
+            else if (b.kind != sim::Solid) col = ccc4f(0.8f, 0.4f, 1.f, 0.8f);
+            CCPoint v[4];
+            unsigned n = 4;
+            if (b.kind == sim::Slope) {
+                bool right = (b.corner & 1) != 0, top = (b.corner & 2) != 0;
+                float cx = right ? b.x1 : b.x0, cy = top ? b.y1 : b.y0;
+                v[0] = CCPoint{cx, cy};
+                v[1] = CCPoint{right ? b.x0 : b.x1, cy};
+                v[2] = CCPoint{cx, top ? b.y0 : b.y1};
+                n = 3;
+            } else {
+                v[0] = CCPoint{b.x0, b.y0};
+                v[1] = CCPoint{b.x1, b.y0};
+                v[2] = CCPoint{b.x1, b.y1};
+                v[3] = CCPoint{b.x0, b.y1};
+            }
+            f->traj->drawPolygon(v, n, ccc4f(0.f, 0.f, 0.f, 0.f), 1.f, col);
+        };
+        for (auto const& b : sim::boxes) draw(b);
+        for (auto const& b : sim::wide) draw(b);
     }
 
     void drawCubeTrajectoryBody(sim::S const& start) {
@@ -1395,7 +1467,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         path(true,  ccc4f(0.3f, 1.f, 0.4f, 0.9f));
     }
 
-    void botPress(sim::S const& s, int cooldown = 3) {
+    void botPress(sim::S const& s, int cooldown = 1) {
         auto f = m_fields.self();
         if (!s.ground) {
             f->lockIdx = sim::findOrb(s);
@@ -1525,7 +1597,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool ok = findWindow(3.f, aimX, lastX) || findWindow(0.f, aimX, lastX);
 
         if (!ok) {
-            if (act && d <= 3) this->botPress(s, 12); // last-ditch jump
+            if (act && d <= 3) this->botPress(s, 6); // last-ditch jump
             return;
         }
 
