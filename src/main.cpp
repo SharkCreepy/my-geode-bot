@@ -13,9 +13,6 @@
 
 using namespace geode::prelude;
 
-// ===============================================================
-// Shared state
-// ===============================================================
 #if defined(GEODE_IS_ANDROID) || defined(GEODE_IS_IOS)
 constexpr float DEFAULT_HUD_SCALE = 1.3f;
 #else
@@ -75,9 +72,6 @@ $on_mod(Loaded) {
     g.load();
 }
 
-// ===============================================================
-// Speedhack
-// ===============================================================
 class $modify(SpeedScheduler, CCScheduler) {
     void update(float dt) {
         if (g.speedOn && PlayLayer::get()) dt *= g.speed;
@@ -103,15 +97,16 @@ namespace sim {
     inline std::vector<Box> wide;
     inline float maxW = 30.f;
     inline float floorY = 90.f;
-    inline float ceilY = 570.f;   // real GD ceiling
+    inline float ceilY = 570.f;
     inline int nSolid = 0, nHazard = 0, nPad = 0, nOrb = 0, nPortal = 0;
 
     constexpr float HALF = 15.f;
-    constexpr float HAZ_HALF = 11.5f;
-    constexpr float ORB_HALF = 12.f;
+    constexpr float HAZ_HALF = 10.f; 
+    constexpr float ORB_HALF = 10.f; 
     constexpr float TERMINAL = -15.f;
     constexpr int SUB = 2;
 
+    // 100% HARDCODED PERFECT GEOMETRY DASH PHYSICS
     inline float jumpVel = 11.180032f;
     inline float grav = 0.958199f;
     inline float portalMul = 0.5f;
@@ -216,7 +211,6 @@ namespace sim {
                     s.vy = 0.f;
                     s.ground = true;
                 } else if (s.vy > 0.f && prevTop <= by0 + 1.f) {
-                    // Underside of a solid: stop upward motion, don't die.
                     ly = by0 - HALF;
                     s.y = ly * up;
                     s.vy = 0.f;
@@ -286,31 +280,6 @@ namespace sim {
         return -1;
     }
 
-    inline void flatJump(float v0, float g, float& H, float& T) {
-        float y = 0.f, vy = v0;
-        H = 0.f; T = 200.f;
-        constexpr float dt = 1.f / SUB;
-        for (int i = 0; i < SUB * 200; i++) {
-            vy = std::max(vy - g * dt, TERMINAL);
-            y += vy * dt;
-            H = std::max(H, y);
-            if (y <= 0.f && vy < 0.f) { T = (i + 1) * dt; return; }
-        }
-    }
-
-    inline bool calibrate(float Hm, float Tm) {
-        float Hs, Ts;
-        flatJump(jumpVel, grav, Hs, Ts);
-        if (Hs <= 0.f || Ts <= 0.f || Hm <= 0.f || Tm <= 0.f) return false;
-        float rH = Hm / Hs, rT = Tm / Ts;
-        if (rH < 0.75f || rH > 1.3f || rT < 0.75f || rT > 1.3f) return false;
-        float nv = jumpVel * rH / rT;
-        float ng = grav * rH / (rT * rT);
-        jumpVel = std::clamp(jumpVel + (nv - jumpVel) * 0.5f, 7.f, 16.f);
-        grav = std::clamp(grav + (ng - grav) * 0.5f, 0.5f, 1.5f);
-        return true;
-    }
-
     struct Planner {
         int H = 70;
         float vx = 5.19f;
@@ -347,7 +316,7 @@ namespace sim {
 }
 
 // ===============================================================
-// Wave physics (substepped, 45-degree)
+// Wave physics
 // ===============================================================
 namespace waveSim {
     constexpr float HALF = sim::HALF;
@@ -421,13 +390,19 @@ namespace waveSim {
 }
 
 $on_mod(Loaded) {
+    // FORCE standard physics and overwrite corrupted save data
     auto m = Mod::get();
-    sim::jumpVel = std::clamp(m->getSavedValue<float>("jumpVel", sim::jumpVel), 7.f, 16.f);
-    sim::grav = std::clamp(m->getSavedValue<float>("grav", sim::grav), 0.5f, 1.5f);
-    sim::portalMul = std::clamp(m->getSavedValue<float>("portalMul", sim::portalMul), 0.f, 1.3f);
+    m->setSavedValue<float>("jumpVel", 11.180032f);
+    m->setSavedValue<float>("grav", 0.958199f);
+    sim::jumpVel = 11.180032f;
+    sim::grav = 0.958199f;
+    sim::portalMul = 0.5f;
+    
     for (int k = sim::PadYellow; k < sim::KindCount; k++) {
-        sim::launch[k] = std::clamp(
-            m->getSavedValue<float>(fmt::format("launch{}", k), sim::launch[k]), -3.5f, 3.5f);
+        if (sim::isOrb(k)) sim::launch[k] = (k == sim::OrbYellow) ? 1.00f :
+                                            (k == sim::OrbPink)   ? 0.68f :
+                                            (k == sim::OrbRed)    ? 1.30f :
+                                            (k == sim::OrbBlue)   ? -1.1f : -1.3f;
     }
 }
 
@@ -759,19 +734,12 @@ class $modify(BotPlayLayer, PlayLayer) {
         int stepsThisTick = 0;
         float tpsEma = 240.f;
 
-        bool arcActive = false;
-        bool arcWasGround = true;
-        float arcStartX = 0.f, arcStartY = 0.f, arcApex = 0.f;
-        float arcPrevX = 0.f, arcPrevY = 0.f;
-        float arcUp = 1.f;
-
         bool stepInit = false;
         float stepPrevX = 0.f, stepPrevY = 0.f, stepPrevAbs = 0.f;
         bool stepPrevGround = true, stepPrevFlip = false;
 
         CCDrawNode* traj = nullptr;
 
-        // Trajectory cache
         bool  trajDirty = true;
         int   trajCounter = 0;
         bool  trajPrevGround = true;
@@ -780,7 +748,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         int   trajPrevWaveDir = 1;
         bool  trajPrevWasWave = false;
 
-        // Bot
         int botRelease = 0;
         bool botHolding = false;
         bool havePlan = false;
@@ -902,6 +869,9 @@ class $modify(BotPlayLayer, PlayLayer) {
             auto pos = obj->getPosition();
             if (pos.x < winX0 || pos.x > winX1) continue;
 
+            // Ignore slopes entirely (the sim is flat-rectangle based)
+            if (obj->m_objectType == GameObjectType::Slope || obj->m_objectType == GameObjectType::Slope2) continue;
+
             int kind = -1;
             switch (obj->m_objectID) {
                 case 35:   kind = sim::PadYellow; break;
@@ -924,7 +894,10 @@ class $modify(BotPlayLayer, PlayLayer) {
             CCRect r;
 
             if (sim::isOrb(kind)) {
-                r = CCRect(pos.x - 18.f, pos.y - 18.f, 36.f, 36.f);
+                r = CCRect(pos.x - 15.f, pos.y - 15.f, 30.f, 30.f);
+            } else if (kind == sim::Hazard) {
+                // PERFECT SPIKE HITBOX (15x15 triangle at the bottom)
+                r = CCRect(pos.x - 7.5f, pos.y - 15.f, 15.f, 15.f);
             } else {
                 r = obj->getObjectRect();
                 float mx = r.origin.x + r.size.width * 0.5f;
@@ -933,12 +906,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                              std::abs(mx - pos.x) < 80.f && std::abs(my - pos.y) < 80.f;
                 if (!valid) {
                     auto bb = obj->boundingBox();
-                    if (kind == sim::Hazard) {
-                        float cx = bb.origin.x + bb.size.width * 0.5f;
-                        float cy = bb.origin.y + bb.size.height * 0.5f;
-                        float w = bb.size.width * 0.55f, h = bb.size.height * 0.55f;
-                        r = CCRect(cx - w * 0.5f, cy - h * 0.5f, w, h);
-                    } else if (sim::isPortal(kind)) {
+                    if (sim::isPortal(kind)) {
                         r = CCRect(pos.x - 10.f, bb.origin.y, 20.f, bb.size.height);
                     } else if (sim::isPad(kind)) {
                         r = CCRect(pos.x - 15.f, pos.y - 15.f, 30.f, 12.f);
@@ -952,8 +920,8 @@ class $modify(BotPlayLayer, PlayLayer) {
             bool isDynamic = false;
             auto oit = oldPos.find(obj);
             if (oit != oldPos.end()) {
-                if (std::abs(oit->second.first  - r.origin.x) > 0.5f ||
-                    std::abs(oit->second.second - r.origin.y) > 0.5f) {
+                if (std::abs(oit->second.first  - r.origin.x) > 0.1f ||
+                    std::abs(oit->second.second - r.origin.y) > 0.1f) {
                     isDynamic = true;
                 }
             }
@@ -1015,7 +983,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->deadSteps = 0;
         f->stepsSinceHit = 1000;
         f->hitFlag = false;
-        f->arcActive = false;
         f->stepInit = false;
         f->haveLast = false;
 
@@ -1146,104 +1113,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->stepHookSeen = true;
         f->stepsThisTick++;
         this->registerStep(true);
-        this->sampleArc();
-        this->learnLaunch();
-    }
-
-    void learnLaunch() {
-        auto f = m_fields.self();
-        if (!m_player1 || sim::boxes.empty()) return;
-
-        float x = m_player1->getPositionX();
-        float y = m_player1->getPositionY();
-        bool flip = m_player1->m_isUpsideDown;
-        bool localGround = this->isOnLocalGround(x, y, flip);
-
-        float tps = std::max(60.f, std::round(f->tpsEma / 60.f) * 60.f);
-        float absV = (y - f->stepPrevY) / (60.f / tps);
-
-        if (f->stepInit && this->cubeMode() && std::abs(absV - f->stepPrevAbs) > 3.f && std::abs(absV) < 40.f) {
-            int launcher = -1, portal = -1;
-            sim::forEachNear(f->stepPrevX, [&](sim::Box const& b) {
-                if (!sim::overlap(f->stepPrevX, f->stepPrevY, sim::ORB_HALF + 6.f, b)) return;
-                if (sim::isPad(b.kind) || sim::isOrb(b.kind)) { if (launcher < 0) launcher = b.kind; }
-                else if (sim::isPortal(b.kind)) { if (portal < 0) portal = b.kind; }
-            });
-
-            auto m = Mod::get();
-            if (launcher >= 0) {
-                float mult = (absV * (flip ? -1.f : 1.f)) / sim::jumpVel;
-                if (std::abs(mult) > 0.1f && std::abs(mult) < 3.5f) {
-                    sim::launch[launcher] += (mult - sim::launch[launcher]) * 0.5f;
-                    m->setSavedValue<float>(fmt::format("launch{}", launcher), sim::launch[launcher]);
-                }
-            } else if (portal >= 0 && flip != f->stepPrevFlip && std::abs(f->stepPrevAbs) > 4.f) {
-                float r = absV / f->stepPrevAbs;
-                if (r > 0.f && r < 1.3f) {
-                    sim::portalMul += (r - sim::portalMul) * 0.5f;
-                    m->setSavedValue<float>("portalMul", sim::portalMul);
-                }
-            }
-        }
-
-        f->stepInit = true;
-        f->stepPrevX = x;
-        f->stepPrevY = y;
-        f->stepPrevAbs = absV;
-        f->stepPrevGround = localGround;
-        f->stepPrevFlip = flip;
-    }
-
-    void sampleArc() {
-        auto f = m_fields.self();
-        if (!m_player1) return;
-        float x = m_player1->getPositionX();
-        float y = m_player1->getPositionY();
-        bool ground = m_player1->m_isOnGround;
-        bool flip = m_player1->m_isUpsideDown;
-        float up = flip ? -1.f : 1.f;
-
-        if (!this->cubeMode()) {
-            f->arcActive = false;
-        } else if (!f->arcActive) {
-            if (f->arcWasGround && !ground && (y - f->arcPrevY) * up > 0.01f) {
-                f->arcActive = true;
-                f->arcUp = up;
-                f->arcStartX = f->arcPrevX;
-                f->arcStartY = f->arcPrevY;
-                f->arcApex = (y - f->arcStartY) * up;
-
-                sim::forEachNear(f->arcPrevX, [&](sim::Box const& b) {
-                    if ((sim::isPad(b.kind) || sim::isPortal(b.kind)) &&
-                        sim::overlap(f->arcPrevX, f->arcPrevY, sim::HALF + 6.f, b)) {
-                        f->arcActive = false;
-                    }
-                });
-            }
-        } else {
-            f->arcApex = std::max(f->arcApex, (y - f->arcStartY) * f->arcUp);
-            float dx = x - f->arcStartX;
-
-            sim::S probe;
-            probe.x = x; probe.y = y; probe.ground = ground;
-            if (dx < 0.f || dx > f->vx * 70.f || up != f->arcUp || sim::findOrb(probe) >= 0) {
-                f->arcActive = false;
-            } else if (ground) {
-                f->arcActive = false;
-                float dy = y - f->arcStartY;
-                if (std::abs(dy) < 0.5f && f->vx > 1.f) {
-                    if (sim::calibrate(f->arcApex, dx / f->vx)) {
-                        auto m = Mod::get();
-                        m->setSavedValue<float>("jumpVel", sim::jumpVel);
-                        m->setSavedValue<float>("grav", sim::grav);
-                    }
-                }
-            }
-        }
-
-        f->arcWasGround = ground;
-        f->arcPrevX = x;
-        f->arcPrevY = y;
     }
 
     void tickNoclipStats() {
@@ -1251,7 +1120,6 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         if (!f->stepHookSeen) {
             this->registerStep(false);
-            this->sampleArc();
         }
 
         if (f->hudLabel && ++f->labelTick >= 6) {
@@ -1364,25 +1232,9 @@ class $modify(BotPlayLayer, PlayLayer) {
             if (found >= 0) s.lock = found;
         }
 
-        if (s.ground) {
-            bool onBlock = false;
-            float ly = s.y * up;
-            sim::forEachNear(s.x, [&](sim::Box const& b) {
-                if (b.kind != sim::Solid) return;
-                float by1 = flip ? -b.y0 : b.y1;
-                if (s.x + sim::HALF > b.x0 && s.x - sim::HALF < b.x1 &&
-                    std::abs((ly - sim::HALF) - by1) < 1.5f) onBlock = true;
-            });
-            if (!onBlock) {
-                float worldEdge = flip ? s.y + sim::HALF : s.y - sim::HALF;
-                if (!flip && worldEdge > 84.f && worldEdge < 96.f) sim::floorY = worldEdge;
-                if (flip && worldEdge > 200.f && worldEdge < 900.f) sim::ceilY = worldEdge;
-            }
-        }
         return s;
     }
 
-    // ---- trajectory dispatcher with cache ----
     void drawTrajectory() {
         auto f = m_fields.self();
         if (!f->traj) return;
@@ -1554,7 +1406,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (f->havePlan) {
             if (d < 0) {
                 if (++f->planIdle > 2) { f->havePlan = false; f->trajDirty = true; }
-                return;  // never press on a stale plan
+                return;
             }
             f->planIdle = 0;
 
@@ -1609,7 +1461,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         float firstX = s.x + p.vx * first;
         float lastX  = s.x + p.vx * last;
-        float aimX = lastX - p.vx * 1.0f;
+        float aimX = lastX - p.vx * 1.5f; // Aim slightly before the last possible frame to avoid clipping
         if (aimX < firstX) aimX = firstX;
 
         if (first == 0 && last <= 1) {
