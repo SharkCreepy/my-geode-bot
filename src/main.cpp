@@ -1,14 +1,16 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/ui/Popup.hpp>
+#include <Geode/binding/GameObject.hpp>
 
 using namespace geode::prelude;
 
+// --- Global Toggles ---
 bool g_noclipEnabled = false;
 bool g_autoClickerEnabled = false;
 bool g_layoutModeEnabled = false;
 
-// --- Custom Draggable Button (works by handling touches directly) ---
+// --- Custom Draggable Button (Using cocos2d::EventListenerTouchOneByOne) ---
 class DraggableButton : public CCNode {
 protected:
     bool m_isDragging = false;
@@ -20,14 +22,15 @@ public:
     bool init(CCNode* normalSprite, CCObject* target, SEL_MenuHandler selector) {
         if (!CCNode::init()) return false;
 
-        // Create the actual button so clicks still work
+        // Create a standard button so clicks still work as expected
         m_button = CCMenuItemSpriteExtra::create(normalSprite, nullptr, target, selector);
         m_button->setPosition({0, 0});
         this->addChild(m_button);
 
-        // Set up touch listener
-        auto listener = cocos2d::CCEventListenerTouchOneByOne::create();
+        // CORRECTED for Geode v5: No "CC" prefix on EventListenerTouchOneByOne
+        auto listener = cocos2d::EventListenerTouchOneByOne::create();
         listener->setSwallowTouches(true);
+        
         listener->onTouchBegan = [this](CCTouch* touch, CCEvent* event) {
             auto location = touch->getLocation();
             auto local = this->convertToNodeSpace(location);
@@ -40,29 +43,34 @@ public:
             }
             return false;
         };
+
         listener->onTouchMoved = [this](CCTouch* touch, CCEvent* event) {
             auto location = touch->getLocation();
             auto diff = location - m_startTouch;
+            // If moved more than 5 pixels, it's a drag
             if (std::abs(diff.x) > 5.f || std::abs(diff.y) > 5.f) {
                 m_isDragging = true;
             }
             if (m_isDragging) {
                 auto newPos = m_startPos + diff;
                 auto winSize = CCDirector::sharedDirector()->getWinSize();
+                // Clamp to screen boundaries
                 newPos.x = std::clamp(newPos.x, 25.f, winSize.width - 25.f);
                 newPos.y = std::clamp(newPos.y, 25.f, winSize.height - 25.f);
                 this->setPosition(newPos);
             }
         };
+
         listener->onTouchEnded = [this](CCTouch* touch, CCEvent* event) {
             if (m_isDragging) {
-                m_isDragging = false;
+                m_isDragging = false; // Stop dragging, don't trigger click
             } else {
-                // Simulate a click on the button if it was a tap
-                m_button->activate();
+                m_button->activate(); // It was a tap, trigger the button
             }
         };
-        cocos2d::CCDirector::sharedDirector()->getTouchDispatcher()->addTargetedDelegate(listener, 0, true);
+
+        // Add listener using the EventDispatcher
+        cocos2d::Director::getInstance()->getEventDispatcher()->addEventListenerWithSceneGraphPriority(listener, this);
 
         return true;
     }
@@ -157,13 +165,12 @@ class $modify(MyPlayLayer, PlayLayer) {
         bg->addChild(menuBtnSprite);
         menuBtnSprite->setPosition(bg->getContentSize() / 2);
 
-        // Use our custom DraggableButton!
         auto menuBtn = DraggableButton::create(bg, this, menu_selector(MyPlayLayer::onOpenMenu));
         
         auto winSize = CCDirector::sharedDirector()->getWinSize();
         menuBtn->setPosition({40.f, winSize.height - 40.f});
         
-        // Add the button directly to the layer (no CCMenu needed)
+        // Z-order 9999 ensures it renders above all other UI elements
         this->addChild(menuBtn, 9999); 
 
         return true;
@@ -173,9 +180,10 @@ class $modify(MyPlayLayer, PlayLayer) {
         MyBotMenu::create()->show();
     }
 
+    // --- Noclip Logic (Hooks PlayLayer::destroyPlayer) ---
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         if (g_noclipEnabled) {
-            return; 
+            return; // Skip the original function to prevent death
         }
         PlayLayer::destroyPlayer(player, object);
     }
@@ -183,13 +191,13 @@ class $modify(MyPlayLayer, PlayLayer) {
     void update(float dt) {
         PlayLayer::update(dt);
 
-        // Autoclicker Logic
+        // --- Autoclicker Logic ---
         if (g_autoClickerEnabled && m_player1) {
             m_player1->pushButton(PlayerButton::Jump);
             m_player1->releaseButton(PlayerButton::Jump);
         }
 
-        // Layout Mode Logic (Only apply when the toggle changes to prevent lag)
+        // --- Layout Mode Logic (Only apply when the toggle changes) ---
         if (g_layoutModeEnabled != m_fields->m_prevLayoutMode) {
             m_fields->m_prevLayoutMode = g_layoutModeEnabled;
             applyLayoutMode(g_layoutModeEnabled);
@@ -197,7 +205,7 @@ class $modify(MyPlayLayer, PlayLayer) {
     }
 
     void applyLayoutMode(bool enable) {
-        // 1. Hide/Show Decorations
+        // 1. Hide/Show Decoration Objects
         if (m_objects) {
             for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
                 if (obj->m_objectType == GameObjectType::Decoration) {
@@ -206,7 +214,7 @@ class $modify(MyPlayLayer, PlayLayer) {
             }
         }
 
-        // 2. Change Background Color
+        // 2. Change Background Color to Solid Blue
         if (m_background) {
             if (enable) {
                 m_background->setColor({40, 62, 255}); 
