@@ -1,164 +1,183 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/ui/Popup.hpp>
-#include <Geode/binding/GameObject.hpp>
+#include <functional>
+#include <algorithm>
+#include <cmath>
 
 using namespace geode::prelude;
 
-// --- Global Toggles ---
-bool g_noclipEnabled = false;
-bool g_autoClickerEnabled = false;
-bool g_layoutModeEnabled = false;
+// ---------------------------------------------------------------
+// Settings (saved between sessions)
+// ---------------------------------------------------------------
+namespace cfg {
+    inline bool get(char const* key) {
+        return Mod::get()->getSavedValue<bool>(key, false);
+    }
+    inline void set(char const* key, bool v) {
+        Mod::get()->setSavedValue<bool>(key, v);
+    }
+    constexpr float CLICKS_PER_SECOND = 10.f;
+    constexpr float HOLD_TIME = 0.04f;
+}
 
-// --- Custom Draggable Button (Foolproof Version) ---
-class DraggableButton : public CCNode, public cocos2d::CCTargetedTouchDelegate {
+// ---------------------------------------------------------------
+// Draggable floating button
+// Tap = open menu, drag = move (position is saved)
+// ---------------------------------------------------------------
+class DraggableButton : public CCNode, public CCTouchDelegate {
 protected:
-    bool m_isDragging = false;
-    CCPoint m_startPos;
-    CCPoint m_startTouch;
-    CCObject* m_target;
-    SEL_MenuHandler m_selector;
-    CCMenuItemSpriteExtra* m_button;
+    CCNode* m_visual = nullptr;
+    std::function<void()> m_onTap;
+    bool m_dragging = false;
+    bool m_touching = false;
+    CCPoint m_nodeStart;
+    CCPoint m_touchStart;
 
-public:
-    bool init(CCNode* normalSprite, CCObject* target, SEL_MenuHandler selector) {
+    bool init(CCNode* visual, std::function<void()> onTap) {
         if (!CCNode::init()) return false;
+        m_onTap = std::move(onTap);
+        m_visual = visual;
 
-        m_target = target;
-        m_selector = selector;
-
-        // Create the visual button
-        m_button = CCMenuItemSpriteExtra::create(normalSprite, nullptr, target, selector);
-        m_button->setPosition({22.5f, 22.5f}); 
-        this->addChild(m_button);
-        
-        // Hardcode the size to 45x45 (matching your background sprite)
         this->setContentSize({45.f, 45.f});
         this->setAnchorPoint({0.5f, 0.5f});
-
-        // FIX 1: Set priority to -502 (higher than the game's touch priority)
-        CCTouchDispatcher::get()->addTargetedDelegate(this, -502, true);
-
+        visual->setPosition(this->getContentSize() / 2);
+        this->addChild(visual);
         return true;
     }
 
-    void onExit() {
+    // Is this node actually on screen and usable?
+    bool isUsable() {
+        for (CCNode* n = this; n; n = n->getParent()) {
+            if (!n->isVisible()) return false;
+        }
+        return true;
+    }
+
+public:
+    static DraggableButton* create(CCNode* visual, std::function<void()> onTap) {
+        auto ret = new DraggableButton();
+        if (ret->init(visual, std::move(onTap))) {
+            ret->autorelease();
+            return ret;
+        }
+        delete ret;
+        return nullptr;
+    }
+
+    void onEnter() override {
+        CCNode::onEnter();
+        CCTouchDispatcher::get()->addTargetedDelegate(this, -600, true);
+    }
+
+    void onExit() override {
         CCTouchDispatcher::get()->removeDelegate(this);
         CCNode::onExit();
     }
 
-    bool ccTouchBegan(CCTouch* touch, CCEvent* event) override {
-        auto location = touch->getLocation();
-        // Convert the screen touch to our button's local coordinates
-        auto local = this->convertToNodeSpace(location);
+    bool ccTouchBegan(CCTouch* touch, CCEvent*) override {
+        if (!isUsable()) return false;
+
+        auto local = this->convertToNodeSpace(touch->getLocation());
         auto size = this->getContentSize();
-        
-        // Check if the touch is inside our 45x45 box
-        if (local.x >= 0 && local.x <= size.width && local.y >= 0 && local.y <= size.height) {
-            m_startPos = this->getPosition();
-            m_startTouch = location;
-            m_isDragging = false;
-            return true;
+        if (local.x < 0 || local.y < 0 || local.x > size.width || local.y > size.height) {
+            return false;
         }
-        return false;
+
+        m_touching = true;
+        m_dragging = false;
+        m_nodeStart = this->getPosition();
+        m_touchStart = this->getParent()
+            ? this->getParent()->convertToNodeSpace(touch->getLocation())
+            : touch->getLocation();
+        m_visual->setScale(0.92f);
+        return true; // swallow so the game doesn't also register a jump
     }
 
-    void ccTouchMoved(CCTouch* touch, CCEvent* event) override {
-        auto location = touch->getLocation();
-        auto diff = location - m_startTouch;
-        
-        if (std::abs(diff.x) > 5.f || std::abs(diff.y) > 5.f) {
-            m_isDragging = true;
-        }
-        
-        if (m_isDragging) {
-            auto newPos = m_startPos + diff;
-            auto winSize = CCDirector::sharedDirector()->getWinSize();
-            // Keep it on screen
-            newPos.x = std::clamp(newPos.x, 25.f, winSize.width - 25.f);
-            newPos.y = std::clamp(newPos.y, 25.f, winSize.height - 25.f);
-            this->setPosition(newPos);
-        }
-    }
+    void ccTouchMoved(CCTouch* touch, CCEvent*) override {
+        if (!m_touching) return;
 
-    void ccTouchEnded(CCTouch* touch, CCEvent* event) override {
-        if (m_isDragging) {
-            m_isDragging = false; // Stop dragging, do not click
-        } else {
-            // Manually trigger the menu open function
-            if (m_target && m_selector) {
-                (m_target->*m_selector)(this);
-            }
+        auto parent = this->getParent();
+        auto now = parent ? parent->convertToNodeSpace(touch->getLocation()) : touch->getLocation();
+        auto diff = now - m_touchStart;
+
+        if (!m_dragging && (std::abs(diff.x) > 6.f || std::abs(diff.y) > 6.f)) {
+            m_dragging = true;
+        }
+
+        if (m_dragging) {
+            auto win = CCDirector::sharedDirector()->getWinSize();
+            auto p = m_nodeStart + diff;
+            p.x = std::clamp(p.x, 25.f, win.width - 25.f);
+            p.y = std::clamp(p.y, 25.f, win.height - 25.f);
+            this->setPosition(p);
         }
     }
 
-    void ccTouchCancelled(CCTouch* touch, CCEvent* event) override {
-        m_isDragging = false;
+    void ccTouchEnded(CCTouch*, CCEvent*) override {
+        if (!m_touching) return;
+        m_touching = false;
+        m_visual->setScale(1.f);
+
+        if (m_dragging) {
+            m_dragging = false;
+            auto p = this->getPosition();
+            Mod::get()->setSavedValue<float>("btn-x", p.x);
+            Mod::get()->setSavedValue<float>("btn-y", p.y);
+        } else if (m_onTap) {
+            m_onTap();
+        }
     }
 
-    static DraggableButton* create(CCNode* normalSprite, CCObject* target, SEL_MenuHandler selector) {
-        auto ret = new DraggableButton();
-        if (ret && ret->init(normalSprite, target, selector)) {
-            ret->autorelease();
-            return ret;
-        }
-        delete ret;
-        return nullptr;
+    void ccTouchCancelled(CCTouch*, CCEvent*) override {
+        m_touching = false;
+        m_dragging = false;
+        m_visual->setScale(1.f);
     }
 };
 
-// --- The Menu Popup ---
-class MyBotMenu : public Popup { 
+// ---------------------------------------------------------------
+// Menu popup
+// ---------------------------------------------------------------
+class BotMenu : public Popup {
 protected:
-    bool init() override { 
-        if (!Popup::init(280.f, 180.f)) return false;
+    bool init() {
+        if (!Popup::init(280.f, 190.f)) return false;
         this->setTitle("Bot Menu");
 
         auto menu = CCMenu::create();
-        menu->setPosition({140.f, 90.f}); 
-        this->m_mainLayer->addChild(menu); 
+        menu->setPosition({140.f, 90.f});
+        m_mainLayer->addChild(menu);
 
-        auto createToggle = [&](const char* text, bool& value, float yPos) {
-            auto label = CCLabelBMFont::create(text, "bigFont.fnt");
-            label->setScale(0.6f);
-            
-            auto spriteOn = CCSprite::createWithSpriteFrameName("GJ_checkOn_001.png");
-            auto spriteOff = CCSprite::createWithSpriteFrameName("GJ_checkOff_001.png");
-            
-            auto toggleBtn = CCMenuItemToggler::create(
-                spriteOff, spriteOn, this, menu_selector(MyBotMenu::onToggle)
-            );
-            
-            toggleBtn->setPosition({-60.f, yPos});
-            toggleBtn->toggle(value);
-            toggleBtn->setUserData(&value); 
-            menu->addChild(toggleBtn);
-
-            label->setPosition({20.f, yPos});
-            menu->addChild(label);
-        };
-
-        createToggle("Noclip", g_noclipEnabled, 40.f);
-        createToggle("Autoclicker", g_autoClickerEnabled, 0.f);
-        createToggle("Layout Mode", g_layoutModeEnabled, -40.f);
-
+        this->addToggle(menu, "Noclip", "noclip", 40.f);
+        this->addToggle(menu, "Autoclicker", "autoclicker", 0.f);
+        this->addToggle(menu, "Layout Mode", "layout", -40.f);
         return true;
     }
 
-    void onToggle(CCObject* sender) {
-        auto toggle = static_cast<CCMenuItemToggler*>(sender);
-        if (toggle) {
-            bool* valuePtr = static_cast<bool*>(toggle->getUserData());
-            if (valuePtr) {
-                *valuePtr = !toggle->isToggled();
-            }
-        }
+    void addToggle(CCMenu* menu, char const* text, char const* key, float y) {
+        auto on = CCSprite::createWithSpriteFrameName("GJ_checkOn_001.png");
+        auto off = CCSprite::createWithSpriteFrameName("GJ_checkOff_001.png");
+
+        auto toggler = CCMenuItemExt::createToggler(on, off, [key](CCMenuItemToggler* t) {
+            // callback runs before the visual state flips
+            cfg::set(key, !t->isToggled());
+        });
+        toggler->toggle(cfg::get(key));
+        toggler->setPosition({-80.f, y});
+        menu->addChild(toggler);
+
+        auto label = CCLabelBMFont::create(text, "bigFont.fnt");
+        label->setScale(0.55f);
+        label->setAnchorPoint({0.f, 0.5f});
+        label->setPosition({-55.f, y});
+        menu->addChild(label);
     }
 
 public:
-    static MyBotMenu* create() {
-        auto ret = new MyBotMenu();
-        if (ret && ret->init()) {
+    static BotMenu* create() {
+        auto ret = new BotMenu();
+        if (ret->init()) {
             ret->autorelease();
             return ret;
         }
@@ -167,81 +186,121 @@ public:
     }
 };
 
-// --- Hook into the Gameplay Layer ---
-class $modify(MyPlayLayer, PlayLayer) {
+// ---------------------------------------------------------------
+// PlayLayer hook
+// ---------------------------------------------------------------
+class $modify(BotPlayLayer, PlayLayer) {
     struct Fields {
-        bool m_prevLayoutMode = false;
+        bool prevLayout = false;
+        float clickTimer = 0.f;
+        float holdTimer = 0.f;
+        bool holding = false;
     };
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
-        auto menuBtnSprite = CCSprite::createWithSpriteFrameName("GJ_optionsBtn_001.png");
-        if (!menuBtnSprite) return true;
-        
-        menuBtnSprite->setScale(0.9f);
-        auto bg = cocos2d::extension::CCScale9Sprite::create("square02_small.png");
-        bg->setContentSize({45, 45});
-        bg->setOpacity(100);
-        bg->addChild(menuBtnSprite);
-        menuBtnSprite->setPosition(bg->getContentSize() / 2);
+        // Button visual
+        auto bg = extension::CCScale9Sprite::create("square02_small.png");
+        bg->setContentSize({45.f, 45.f});
+        bg->setOpacity(110);
 
-        auto menuBtn = DraggableButton::create(bg, this, menu_selector(MyPlayLayer::onOpenMenu));
-        
-        auto winSize = CCDirector::sharedDirector()->getWinSize();
-        menuBtn->setPosition({40.f, winSize.height - 40.f});
-        
-        // FIX 2: Add the button to the absolute top-level scene so PlayLayer can't hide or block it
-        auto runningScene = CCDirector::sharedDirector()->getRunningScene();
-        if (runningScene) {
-            runningScene->addChild(menuBtn, 999999); 
-        } else {
-            this->addChild(menuBtn, 999999);
+        if (auto icon = CCSprite::createWithSpriteFrameName("GJ_optionsBtn_001.png")) {
+            icon->setScale(0.9f);
+            icon->setPosition(bg->getContentSize() / 2);
+            bg->addChild(icon);
         }
+
+        auto btn = DraggableButton::create(bg, [] {
+            BotMenu::create()->show();
+        });
+        if (!btn) return true;
+
+        auto win = CCDirector::sharedDirector()->getWinSize();
+        float x = Mod::get()->getSavedValue<float>("btn-x", 40.f);
+        float y = Mod::get()->getSavedValue<float>("btn-y", win.height - 40.f);
+        btn->setPosition({
+            std::clamp(x, 25.f, win.width - 25.f),
+            std::clamp(y, 25.f, win.height - 25.f)
+        });
+
+        // UILayer lives inside the PlayLayer's own scene, so it's never the wrong scene
+        if (m_uiLayer) m_uiLayer->addChild(btn, 1000);
+        else this->addChild(btn, 1000);
 
         return true;
     }
 
-    void onOpenMenu(CCObject* sender) {
-        MyBotMenu::create()->show();
+    void destroyPlayer(PlayerObject* player, GameObject* object) {
+        if (cfg::get("noclip")) return;
+        PlayLayer::destroyPlayer(player, object);
     }
 
-    void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (g_noclipEnabled) {
-            return; 
-        }
-        PlayLayer::destroyPlayer(player, object);
+    void resetLevel() {
+        PlayLayer::resetLevel();
+        m_fields->clickTimer = 0.f;
+        m_fields->holdTimer = 0.f;
+        m_fields->holding = false;
+        // objects get reset, so re-apply layout visuals
+        this->applyLayoutMode(cfg::get("layout"));
+    }
+
+    void onQuit() {
+        // restore anything we touched
+        this->applyLayoutMode(false);
+        PlayLayer::onQuit();
     }
 
     void update(float dt) {
         PlayLayer::update(dt);
 
-        if (g_autoClickerEnabled && m_player1) {
-            m_player1->pushButton(PlayerButton::Jump);
-            m_player1->releaseButton(PlayerButton::Jump);
+        if (cfg::get("autoclicker")) this->tickAutoclicker(dt);
+
+        bool layout = cfg::get("layout");
+        if (layout != m_fields->prevLayout) {
+            m_fields->prevLayout = layout;
+            this->applyLayoutMode(layout);
+        }
+    }
+
+    void tickAutoclicker(float dt) {
+        if (m_player1 && m_player1->m_isDead) return;
+        auto f = m_fields.self();
+
+        if (f->holding) {
+            f->holdTimer -= dt;
+            if (f->holdTimer <= 0.f) {
+                f->holding = false;
+                m_player1->releaseButton(PlayerButton::Jump);
+                if (m_gameState.m_isDualMode && m_player2) {
+                    m_player2->releaseButton(PlayerButton::Jump);
+                }
+            }
+            return;
         }
 
-        if (g_layoutModeEnabled != m_fields->m_prevLayoutMode) {
-            m_fields->m_prevLayoutMode = g_layoutModeEnabled;
-            applyLayoutMode(g_layoutModeEnabled);
+        f->clickTimer += dt;
+        if (f->clickTimer >= 1.f / cfg::CLICKS_PER_SECOND) {
+            f->clickTimer = 0.f;
+            f->holding = true;
+            f->holdTimer = cfg::HOLD_TIME;
+            m_player1->pushButton(PlayerButton::Jump);
+            if (m_gameState.m_isDualMode && m_player2) {
+                m_player2->pushButton(PlayerButton::Jump);
+            }
         }
     }
 
     void applyLayoutMode(bool enable) {
         if (m_objects) {
             for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
-                if (obj->m_objectType == GameObjectType::Decoration) {
+                if (obj && obj->m_objectType == GameObjectType::Decoration) {
                     obj->setVisible(!enable);
                 }
             }
         }
-
         if (m_background) {
-            if (enable) {
-                m_background->setColor({40, 62, 255}); 
-            } else {
-                m_background->setColor({255, 255, 255}); 
-            }
+            m_background->setColor(enable ? ccColor3B{40, 62, 255} : ccColor3B{255, 255, 255});
         }
     }
 };
