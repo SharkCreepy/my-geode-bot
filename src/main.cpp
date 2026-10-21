@@ -22,13 +22,12 @@ public:
     bool init(CCNode* normalSprite, CCObject* target, SEL_MenuHandler selector) {
         if (!CCNode::init()) return false;
 
-        // Create the underlying button
         m_button = CCMenuItemSpriteExtra::create(normalSprite, nullptr, target, selector);
         m_button->setPosition({0, 0});
         this->addChild(m_button);
 
-        // Use the correct class name for Geode v5
-        auto listener = EventListenerTouchOneByOne::create();
+        // Use the cocos2d namespace for the touch listener
+        auto listener = cocos2d::EventListenerTouchOneByOne::create();
         listener->setSwallowTouches(true);
 
         listener->onTouchBegan = [this](CCTouch* touch, CCEvent* event) {
@@ -67,8 +66,8 @@ public:
             }
         };
 
-        // Use the node's dispatcher or the director's
-        this->getEventDispatcher()->addEventListenerWithSceneGraphPriority(listener, this);
+        // Register with the global touch dispatcher
+        cocos2d::CCTouchDispatcher::get()->addTargetedDelegate(listener, 0, true);
 
         return true;
     }
