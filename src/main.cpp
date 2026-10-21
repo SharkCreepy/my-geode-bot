@@ -7,10 +7,10 @@
 #include <functional>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 #include <string>
 #include <unordered_map>
-#include <deque>
 
 using namespace geode::prelude;
 
@@ -81,42 +81,39 @@ class $modify(SpeedScheduler, CCScheduler) {
 };
 
 // ===============================================================
-// Cube / Ball / Ship physics simulator
+// Cube physics simulator
 // ===============================================================
 namespace sim {
     enum Kind : int {
-        Solid = 0, Hazard, Slope,
+        Solid = 0, Hazard,
         PortalNormal, PortalInverse,
-        PortalSpeed05, PortalSpeed1, PortalSpeed2, PortalSpeed3, PortalSpeed4,
         PadYellow, PadPink, PadRed, PadBlue,
         OrbYellow, OrbPink, OrbRed, OrbBlue, OrbGreen,
         KindCount
     };
 
-    // Mode: 0 = Cube, 1 = Ship, 2 = Ball
     struct Box { float x0, y0, x1, y1; int kind; GameObject* src = nullptr; };
 
     inline std::vector<Box> boxes;
     inline std::vector<Box> wide;
     inline float maxW = 30.f;
     inline float floorY = 90.f;
-    inline float ceilY = 600.f;
+    inline float ceilY = 600.f; // Give a little extra headroom
     inline int nSolid = 0, nHazard = 0, nPad = 0, nOrb = 0, nPortal = 0;
 
     constexpr float HALF = 15.f;
-    constexpr float HAZ_HALF = 11.f; 
-    constexpr float ORB_HALF = 12.f; 
+    constexpr float HAZ_HALF = 11.f; // Slightly forgiving spike hitbox
+    constexpr float ORB_HALF = 12.f;
     constexpr float TERMINAL = -15.f;
     constexpr int SUB = 2;
 
     inline float jumpVel = 11.180032f;
     inline float grav = 0.958199f;
     inline float portalMul = 0.5f;
-    inline float speedMul = 1.0f;
+    inline float hazMargin = 0.f; // extra hazard clearance, used by the bot when planning
 
     inline float launch[KindCount] = {
         0.f, 0.f, 0.f, 0.f,
-        0.f, 0.f, 0.f, 0.f, 0.f,
         1.40f, 0.93f, 1.79f, -0.9f,
         1.00f, 0.68f, 1.30f, -1.1f, -1.3f
     };
@@ -126,13 +123,12 @@ namespace sim {
         bool ground = false;
         bool dead = false;
         bool flip = false;
-        int mode = 0; // 0=Cube, 1=Ship, 2=Ball
         int lock = -1;
     };
 
     inline bool isPad(int k) { return k >= PadYellow && k <= PadBlue; }
     inline bool isOrb(int k) { return k >= OrbYellow && k <= OrbGreen; }
-    inline bool isPortal(int k) { return k >= PortalNormal && k <= PortalSpeed4; }
+    inline bool isPortal(int k) { return k == PortalNormal || k == PortalInverse; }
     inline bool flipsGravity(int k) { return k == PadBlue || k == OrbBlue || k == OrbGreen; }
 
     inline bool overlap(float x, float y, float h, Box const& b) {
@@ -163,12 +159,12 @@ namespace sim {
     }
 
     inline bool canAct(S const& s) {
-        return !s.dead && (s.ground || s.mode == 1 || findOrb(s) >= 0); // Ship can always act
+        return !s.dead && (s.ground || findOrb(s) >= 0);
     }
 
     inline void activate(S& s, Box const& b, int idx) {
         if (flipsGravity(b.kind)) s.flip = !s.flip;
-        if (isOrb(b.kind)) s.vy = jumpVel * launch[b.kind];
+        s.vy = jumpVel * launch[b.kind];
         s.ground = false;
         s.lock = idx;
     }
@@ -176,17 +172,14 @@ namespace sim {
     inline void step(S& s, float vx, bool press) {
         if (s.dead) return;
 
-        // Apply current speed multiplier
-        float actual_vx = vx * speedMul;
-
         if (press) {
-            if (s.mode == 0) { // Cube
-                int o = findOrb(s);
-                if (o >= 0) activate(s, boxes[o], o);
-                else if (s.ground) { s.vy = jumpVel; s.ground = false; }
-            } else if (s.mode == 2) { // Ball
-                s.flip = !s.flip;
-                s.vy = 0.f;
+            // ORB PRIORITY: Check for orbs first, even if on the ground
+            int o = findOrb(s);
+            if (o >= 0) {
+                activate(s, boxes[o], o);
+            } else if (s.ground) {
+                s.vy = jumpVel;
+                s.ground = false;
             }
         }
 
@@ -198,16 +191,7 @@ namespace sim {
             float prevBottom = ly - HALF;
             float prevTop = ly + HALF;
 
-            // Mode-specific vertical physics
-            if (s.mode == 1) { // Ship
-                s.vy += (press ? 0.6f : -0.6f) * dt;
-                s.vy = std::clamp(s.vy, -8.f, 8.f);
-            } else if (s.mode == 2) { // Ball
-                s.vy = std::max(s.vy - (grav * 1.2f) * dt, TERMINAL);
-            } else { // Cube
-                s.vy = std::max(s.vy - grav * dt, TERMINAL);
-            }
-
+            s.vy = std::max(s.vy - grav * dt, TERMINAL);
             ly += s.vy * dt;
             s.ground = false;
 
@@ -219,44 +203,30 @@ namespace sim {
             s.y = ly * up;
 
             forEachNear(s.x, [&](Box const& b) {
-                if (s.dead) return;
-                if (b.kind == Solid || b.kind == Slope) {
-                    if (!overlap(s.x, s.y, HALF, b)) return;
-                    float by0 = s.flip ? -b.y1 : b.y0;
-                    float by1 = s.flip ? -b.y0 : b.y1;
-
-                    // Basic Slope handling (pushes player up if walking on it)
-                    if (b.kind == Slope) {
-                        float slopeY = b.y0 + (s.x - b.x0);
-                        if (s.y - HALF < slopeY) {
-                            s.y = (slopeY + HALF) * up;
-                            s.vy = 0.f;
-                            s.ground = true;
-                        }
-                        return;
-                    }
-
-                    if (s.vy <= 0.f && prevBottom >= by1 - 1.f) {
-                        ly = by1 + HALF;
-                        s.y = ly * up;
-                        s.vy = 0.f;
-                        s.ground = true;
-                    } else if (s.vy > 0.f && prevTop <= by0 + 1.f) {
-                        ly = by0 - HALF;
-                        s.y = ly * up;
-                        s.vy = 0.f;
-                    }
+                if (b.kind != Solid || s.dead) return;
+                if (!overlap(s.x, s.y, HALF, b)) return;
+                float by0 = s.flip ? -b.y1 : b.y0;
+                float by1 = s.flip ? -b.y0 : b.y1;
+                if (s.vy <= 0.f && prevBottom >= by1 - 1.f) {
+                    ly = by1 + HALF;
+                    s.y = ly * up;
+                    s.vy = 0.f;
+                    s.ground = true;
+                } else if (s.vy > 0.f && prevTop <= by0 + 1.f) {
+                    ly = by0 - HALF;
+                    s.y = ly * up;
+                    s.vy = 0.f;
                 }
             });
             if (s.dead) break;
 
-            s.x += actual_vx * dt;
+            s.x += vx * dt;
             forEachNear(s.x, [&](Box const& b) {
                 if (s.dead) return;
                 float u = s.flip ? -1.f : 1.f;
                 switch (b.kind) {
                     case Hazard:
-                        if (overlap(s.x, s.y, HAZ_HALF, b)) s.dead = true;
+                        if (overlap(s.x, s.y, HAZ_HALF + hazMargin, b)) s.dead = true;
                         break;
                     case Solid:
                         if (overlap(s.x, s.y, HALF, b)) {
@@ -271,23 +241,14 @@ namespace sim {
                             }
                         }
                         break;
-                    case PortalNormal: case PortalInverse:
-                    case PortalSpeed05: case PortalSpeed1: case PortalSpeed2: case PortalSpeed3: case PortalSpeed4: {
-                        if (!overlap(s.x, s.y, ORB_HALF, b)) return;
-                        if (b.kind == PortalNormal || b.kind == PortalInverse) {
-                            bool target = (b.kind == PortalInverse);
-                            if (s.flip != target) {
-                                float absV = s.vy * u;
-                                s.flip = target;
-                                s.vy = absV * portalMul * (s.flip ? -1.f : 1.f);
-                                s.ground = false;
-                            }
-                        } else {
-                            if (b.kind == PortalSpeed05) speedMul = 0.5f;
-                            else if (b.kind == PortalSpeed1) speedMul = 1.0f;
-                            else if (b.kind == PortalSpeed2) speedMul = 1.3f;
-                            else if (b.kind == PortalSpeed3) speedMul = 1.6f;
-                            else if (b.kind == PortalSpeed4) speedMul = 1.9f;
+                    case PortalNormal:
+                    case PortalInverse: {
+                        bool target = (b.kind == PortalInverse);
+                        if (s.flip != target && overlap(s.x, s.y, ORB_HALF, b)) {
+                            float absV = s.vy * u;
+                            s.flip = target;
+                            s.vy = absV * portalMul * (s.flip ? -1.f : 1.f);
+                            s.ground = false;
                         }
                         break;
                     }
@@ -301,7 +262,8 @@ namespace sim {
             });
 
             if (s.lock >= 0) {
-                if (s.lock >= static_cast<int>(boxes.size()) || !overlap(s.x, s.y, ORB_HALF + 4.f, boxes[s.lock])) {
+                if (s.lock >= static_cast<int>(boxes.size()) ||
+                    !overlap(s.x, s.y, ORB_HALF + 4.f, boxes[s.lock])) {
                     s.lock = -1;
                 }
             }
@@ -309,50 +271,46 @@ namespace sim {
     }
 
     inline int horizon(float vx) {
-        return std::clamp(static_cast<int>((550.f * speedMul) / std::max(vx, 1.f)), 55, 120);
+        return std::clamp(static_cast<int>(550.f / std::max(vx, 1.f)), 55, 120);
     }
 
-    // BFS Planner (Breadth-First Search)
+    inline int deathFrame(S s, float vx, int H) {
+        for (int i = 0; i < H; i++) {
+            step(s, vx, false);
+            if (s.dead) return i;
+        }
+        return -1;
+    }
+
     struct Planner {
-        int H = 90;
+        int H = 70;
         float vx = 5.19f;
         int budget = 0;
 
-        struct Node {
-            S state;
-            int frame;
-            int presses;
-            bool firstAction;
-        };
+        struct Cand { int f; S s; };
 
-        bool survive(S start, int initialFrame, bool& shouldPressFirst) {
-            std::deque<Node> q;
-            q.push_back({start, initialFrame, 0, false});
+        bool survive(S s, int frame, int pressesLeft) {
+            Cand cands[64];
+            int nc = 0;
+            S t = s;
+            int f = frame;
+            bool died = false;
 
-            while (!q.empty()) {
+            while (f < H) {
                 if (--budget <= 0) return false;
-                Node n = q.front();
-                q.pop_front();
-
-                if (n.frame >= H) {
-                    shouldPressFirst = n.firstAction;
-                    return true;
+                if (pressesLeft > 0 && (f & 1) == 0 && nc < 64 && canAct(t)) {
+                    cands[nc++] = {f, t};
                 }
+                step(t, vx, false);
+                if (t.dead) { died = true; break; }
+                f++;
+            }
+            if (!died) return true;
 
-                S coast = n.state;
-                step(coast, vx, false);
-                if (!coast.dead) {
-                    q.push_back({coast, n.frame + 1, n.presses, n.firstAction});
-                }
-
-                if (n.presses < 3 && canAct(n.state)) {
-                    S press = n.state;
-                    step(press, vx, true);
-                    if (!press.dead) {
-                        bool isFirst = (n.frame == initialFrame) ? true : n.firstAction;
-                        q.push_back({press, n.frame + 1, n.presses + 1, isFirst});
-                    }
-                }
+            for (int i = nc - 1; i >= 0; i--) {
+                S j = cands[i].s;
+                step(j, vx, true);
+                if (!j.dead && survive(j, cands[i].f + 1, pressesLeft - 1)) return true;
             }
             return false;
         }
@@ -360,32 +318,34 @@ namespace sim {
 }
 
 // ===============================================================
-// Wave physics
+// Wave physics (hold = up, release = down; flipped gravity inverts)
 // ===============================================================
 namespace waveSim {
-    constexpr float HALF = sim::HALF;
-    constexpr float HAZ_HALF = sim::HAZ_HALF;
+    constexpr float HALF = 6.f;      // wave hitbox is much smaller than the cube's - tweak if needed
+    constexpr float HAZ_HALF = 6.f;
+    constexpr int MAXH = 64;
 
     struct S {
         float x = 0.f, y = 0.f;
-        int dir = +1;
+        bool hold = false;
+        bool flip = false;
         bool dead = false;
     };
 
-    inline void step(S& s, float vx, bool click) {
+    inline int dirOf(bool hold, bool flip) { return (hold != flip) ? +1 : -1; }
+
+    inline void step(S& s, float vx, bool hold) {
         if (s.dead) return;
-        if (click) s.dir = -s.dir;
+        s.hold = hold;
+        int dir = dirOf(hold, s.flip);
 
         constexpr int SUB = 2;
         constexpr float dt = 1.f / SUB;
-        float actual_vx = vx * sim::speedMul;
-
         for (int i = 0; i < SUB && !s.dead; i++) {
-            s.x += actual_vx * dt;
-            s.y += s.dir * actual_vx * dt;
+            s.x += vx * dt;
+            s.y += dir * vx * dt;
 
-            if (s.y - HALF < sim::floorY) { s.dead = true; return; }
-            if (s.y + HALF > sim::ceilY)  { s.dead = true; return; }
+            if (s.y - HALF < sim::floorY || s.y + HALF > sim::ceilY) { s.dead = true; return; }
 
             sim::forEachNear(s.x, [&](sim::Box const& b) {
                 if (s.dead) return;
@@ -397,22 +357,62 @@ namespace waveSim {
             });
         }
     }
-}
 
-$on_mod(Loaded) {
-    sim::jumpVel = 11.180032f;
-    sim::grav = 0.958199f;
-    sim::portalMul = 0.5f;
-    for (int k = sim::PadYellow; k < sim::KindCount; k++) {
-        if (sim::isOrb(k)) sim::launch[k] = (k == sim::OrbYellow) ? 1.00f :
-                                            (k == sim::OrbPink)   ? 0.68f :
-                                            (k == sim::OrbRed)    ? 1.30f :
-                                            (k == sim::OrbBlue)   ? -1.1f : -1.3f;
+    struct Node {
+        S s;
+        int n = 0;          // y lattice index (wave moves exactly +-vx per frame)
+        uint8_t first = 0;  // which first actions lead here: bit0 = release, bit1 = hold
+        bool valid = false;
+    };
+
+    // Returns a bitmask of first actions that survive the longest.
+    // bit0 = release, bit1 = hold. 0 = nothing survives.
+    inline int plan(S start, float vx, int H) {
+        H = std::min(H, MAXH);
+        constexpr int N = (2 * MAXH + 1) * 2;
+        static Node bufA[N], bufB[N];
+        Node* cur = bufA;
+        Node* nxt = bufB;
+
+        for (int i = 0; i < N; i++) { cur[i] = Node{}; }
+        int c0 = MAXH * 2 + (start.hold ? 1 : 0);
+        cur[c0].s = start;
+        cur[c0].n = 0;
+        cur[c0].valid = true;
+
+        int lastMask = 0;
+        for (int t = 0; t < H; t++) {
+            for (int i = 0; i < N; i++) nxt[i].valid = false;
+            int mask = 0;
+            for (int i = 0; i < N; i++) {
+                Node const& nd = cur[i];
+                if (!nd.valid) continue;
+                for (int h = 0; h < 2; h++) {
+                    S s = nd.s;
+                    step(s, vx, h == 1);
+                    if (s.dead) continue;
+                    int n = nd.n + dirOf(h == 1, s.flip);
+                    int key = (n + MAXH) * 2 + h;
+                    uint8_t first = (t == 0) ? static_cast<uint8_t>(1 << h) : nd.first;
+                    Node& d = nxt[key];
+                    if (!d.valid) {
+                        d.s = s; d.n = n; d.first = first; d.valid = true;
+                    } else {
+                        d.first |= first;
+                    }
+                    mask |= first;
+                }
+            }
+            if (mask == 0) return lastMask;
+            lastMask = mask;
+            std::swap(cur, nxt);
+        }
+        return lastMask;
     }
 }
 
 // ===============================================================
-// Draggable node & Menu (Unchanged from previous)
+// Draggable node
 // ===============================================================
 class DraggableNode : public CCNode, public CCTouchDelegate {
 protected:
@@ -435,12 +435,14 @@ protected:
         this->setAnchorPoint({0.5f, 0.5f});
         return true;
     }
+
     bool isUsable() {
         for (CCNode* n = this; n; n = n->getParent()) {
             if (!n->isVisible()) return false;
         }
         return true;
     }
+
 public:
     static DraggableNode* create(CCSize size, std::string kx, std::string ky,
                                  std::function<bool()> canDrag, std::function<void()> onTap) {
@@ -452,43 +454,64 @@ public:
         delete ret;
         return nullptr;
     }
+
     void setVisualScaleTarget(CCNode* n) { m_scaleTarget = n; }
+
     void restorePosition(CCPoint def) {
         auto win = CCDirector::sharedDirector()->getWinSize();
         float x = Mod::get()->getSavedValue<float>(m_keyX, def.x);
         float y = Mod::get()->getSavedValue<float>(m_keyY, def.y);
-        this->setPosition({std::clamp(x, 20.f, win.width - 20.f), std::clamp(y, 20.f, win.height - 20.f)});
+        this->setPosition({
+            std::clamp(x, 20.f, win.width - 20.f),
+            std::clamp(y, 20.f, win.height - 20.f)
+        });
     }
+
     void resetPosition(CCPoint def) {
         Mod::get()->setSavedValue<float>(m_keyX, def.x);
         Mod::get()->setSavedValue<float>(m_keyY, def.y);
         this->setPosition(def);
     }
+
     void onEnter() override {
         CCNode::onEnter();
         CCTouchDispatcher::get()->addTargetedDelegate(this, -600, true);
     }
+
     void onExit() override {
         CCTouchDispatcher::get()->removeDelegate(this);
         CCNode::onExit();
     }
+
     bool ccTouchBegan(CCTouch* touch, CCEvent*) override {
-        if (!isUsable() || (m_canDrag && !m_canDrag())) return false;
+        if (!isUsable()) return false;
+        if (m_canDrag && !m_canDrag()) return false;
+
         auto local = this->convertToNodeSpace(touch->getLocation());
         auto size = this->getContentSize();
-        if (local.x < 0 || local.y < 0 || local.x > size.width || local.y > size.height) return false;
-        m_touching = true; m_dragging = false;
+        if (local.x < 0 || local.y < 0 || local.x > size.width || local.y > size.height) {
+            return false;
+        }
+
+        m_touching = true;
+        m_dragging = false;
         m_nodeStart = this->getPosition();
-        m_touchStart = this->getParent() ? this->getParent()->convertToNodeSpace(touch->getLocation()) : touch->getLocation();
+        m_touchStart = this->getParent()
+            ? this->getParent()->convertToNodeSpace(touch->getLocation())
+            : touch->getLocation();
         if (m_scaleTarget) m_scaleTarget->setScale(0.92f);
         return true;
     }
+
     void ccTouchMoved(CCTouch* touch, CCEvent*) override {
         if (!m_touching) return;
         auto parent = this->getParent();
         auto now = parent ? parent->convertToNodeSpace(touch->getLocation()) : touch->getLocation();
         auto diff = now - m_touchStart;
-        if (!m_dragging && (std::abs(diff.x) > 6.f || std::abs(diff.y) > 6.f)) m_dragging = true;
+
+        if (!m_dragging && (std::abs(diff.x) > 6.f || std::abs(diff.y) > 6.f)) {
+            m_dragging = true;
+        }
         if (m_dragging) {
             auto win = CCDirector::sharedDirector()->getWinSize();
             auto p = m_nodeStart + diff;
@@ -497,23 +520,32 @@ public:
             this->setPosition(p);
         }
     }
+
     void ccTouchEnded(CCTouch*, CCEvent*) override {
         if (!m_touching) return;
         m_touching = false;
         if (m_scaleTarget) m_scaleTarget->setScale(1.f);
+
         if (m_dragging) {
             m_dragging = false;
             auto p = this->getPosition();
             Mod::get()->setSavedValue<float>(m_keyX, p.x);
             Mod::get()->setSavedValue<float>(m_keyY, p.y);
-        } else if (m_onTap) m_onTap();
+        } else if (m_onTap) {
+            m_onTap();
+        }
     }
+
     void ccTouchCancelled(CCTouch*, CCEvent*) override {
-        m_touching = false; m_dragging = false;
+        m_touching = false;
+        m_dragging = false;
         if (m_scaleTarget) m_scaleTarget->setScale(1.f);
     }
 };
 
+// ===============================================================
+// Menu popup
+// ===============================================================
 class BotMenu : public Popup {
 protected:
     CCLabelBMFont* m_speedLabel = nullptr;
@@ -523,6 +555,7 @@ protected:
     bool init() {
         if (!Popup::init(340.f, 290.f)) return false;
         this->setTitle("Bot Menu");
+
         auto menu = CCMenu::create();
         menu->setPosition({170.f, 145.f});
         m_mainLayer->addChild(menu);
@@ -539,62 +572,94 @@ protected:
         this->addToggle(menu, "Move HUD",      g.hudEdit,    L, -12.f);
 
         auto resetSpr = ButtonSprite::create("Reset HUD", 80, true, "bigFont.fnt", "GJ_button_04.png", 24.f, 0.5f);
-        auto resetBtn = CCMenuItemExt::createSpriteExtra(resetSpr, [](CCMenuItemSpriteExtra*) { g.hudResetRequested = true; });
+        auto resetBtn = CCMenuItemExt::createSpriteExtra(resetSpr, [](CCMenuItemSpriteExtra*) {
+            g.hudResetRequested = true;
+        });
         resetBtn->setPosition({R + 55.f, -12.f});
         menu->addChild(resetBtn);
 
         m_speedLabel = this->addStepper(menu, -45.f, [this](int dir) {
             g.speed = std::clamp(std::round((g.speed + dir * 0.1f) * 10.f) / 10.f, 0.1f, 5.f);
-            g.save(); m_speedLabel->setString(fmt::format("Speed: {:.1f}x", g.speed).c_str());
+            g.save();
+            m_speedLabel->setString(fmt::format("Speed: {:.1f}x", g.speed).c_str());
         });
         m_speedLabel->setString(fmt::format("Speed: {:.1f}x", g.speed).c_str());
 
         m_cpsLabel = this->addStepper(menu, -75.f, [this](int dir) {
             g.cps = std::clamp(std::round(g.cps + dir), 1.f, 30.f);
-            g.save(); m_cpsLabel->setString(fmt::format("Click CPS: {:.0f}", g.cps).c_str());
+            g.save();
+            m_cpsLabel->setString(fmt::format("Click CPS: {:.0f}", g.cps).c_str());
         });
         m_cpsLabel->setString(fmt::format("Click CPS: {:.0f}", g.cps).c_str());
 
         m_hudLabel = this->addStepper(menu, -105.f, [this](int dir) {
             g.hudScale = std::clamp(std::round((g.hudScale + dir * 0.1f) * 10.f) / 10.f, 0.5f, 2.5f);
-            g.save(); m_hudLabel->setString(fmt::format("HUD Size: {:.1f}x", g.hudScale).c_str());
+            g.save();
+            m_hudLabel->setString(fmt::format("HUD Size: {:.1f}x", g.hudScale).c_str());
         });
         m_hudLabel->setString(fmt::format("HUD Size: {:.1f}x", g.hudScale).c_str());
+
         return true;
     }
 
     void addToggle(CCMenu* menu, char const* text, bool& ref, float x, float y) {
         auto on = CCSprite::createWithSpriteFrameName("GJ_checkOn_001.png");
         auto off = CCSprite::createWithSpriteFrameName("GJ_checkOff_001.png");
+
         bool* p = &ref;
-        auto toggler = CCMenuItemExt::createToggler(on, off, [p](CCMenuItemToggler* t) { *p = !t->isToggled(); g.save(); });
-        toggler->setScale(0.6f); toggler->toggle(ref); toggler->setPosition({x, y}); menu->addChild(toggler);
+        auto toggler = CCMenuItemExt::createToggler(on, off, [p](CCMenuItemToggler* t) {
+            *p = !t->isToggled();
+            g.save();
+        });
+        toggler->setScale(0.6f);
+        toggler->toggle(ref);
+        toggler->setPosition({x, y});
+        menu->addChild(toggler);
+
         auto label = CCLabelBMFont::create(text, "bigFont.fnt");
-        label->setScale(0.42f); label->setAnchorPoint({0.f, 0.5f}); label->setPosition({x + 20.f, y}); menu->addChild(label);
+        label->setScale(0.42f);
+        label->setAnchorPoint({0.f, 0.5f});
+        label->setPosition({x + 20.f, y});
+        menu->addChild(label);
     }
 
     CCLabelBMFont* addStepper(CCMenu* menu, float y, std::function<void(int)> change) {
         auto label = CCLabelBMFont::create("", "bigFont.fnt");
-        label->setScale(0.5f); label->setPosition({0.f, y}); menu->addChild(label);
+        label->setScale(0.5f);
+        label->setPosition({0.f, y});
+        menu->addChild(label);
+
         auto leftSpr = CCSprite::createWithSpriteFrameName("navArrowBtn_001.png");
-        leftSpr->setFlipX(true); leftSpr->setScale(0.6f);
+        leftSpr->setFlipX(true);
+        leftSpr->setScale(0.6f);
         auto left = CCMenuItemExt::createSpriteExtra(leftSpr, [change](CCMenuItemSpriteExtra*) { change(-1); });
-        left->setPosition({-105.f, y}); menu->addChild(left);
+        left->setPosition({-105.f, y});
+        menu->addChild(left);
+
         auto rightSpr = CCSprite::createWithSpriteFrameName("navArrowBtn_001.png");
         rightSpr->setScale(0.6f);
         auto right = CCMenuItemExt::createSpriteExtra(rightSpr, [change](CCMenuItemSpriteExtra*) { change(1); });
-        right->setPosition({105.f, y}); menu->addChild(right);
+        right->setPosition({105.f, y});
+        menu->addChild(right);
+
         return label;
     }
 
 public:
     static BotMenu* create() {
         auto ret = new BotMenu();
-        if (ret->init()) { ret->autorelease(); return ret; }
-        delete ret; return nullptr;
+        if (ret->init()) {
+            ret->autorelease();
+            return ret;
+        }
+        delete ret;
+        return nullptr;
     }
 };
 
+// ===============================================================
+// Layout Mode
+// ===============================================================
 class $modify(LayoutGameObject, GameObject) {
     void setVisible(bool v) {
         if (g.layout && m_objectType == GameObjectType::Decoration) v = false;
@@ -602,23 +667,41 @@ class $modify(LayoutGameObject, GameObject) {
     }
 };
 
+// ===============================================================
+// Infinite Jump
+// ===============================================================
 class $modify(JumpPlayer, PlayerObject) {
     bool pushButton(PlayerButton btn) {
-        if (g.jump && btn == PlayerButton::Jump && PlayLayer::get()) m_isOnGround = true;
+        if (g.jump && btn == PlayerButton::Jump && PlayLayer::get()) {
+            m_isOnGround = true;
+        }
         return PlayerObject::pushButton(btn);
     }
 };
 
+// ===============================================================
+// Ticker
+// ===============================================================
 class Ticker : public CCNode {
 protected:
     std::function<void(float)> m_fn;
+
 public:
     static Ticker* create(std::function<void(float)> fn) {
         auto ret = new Ticker();
-        if (ret->init()) { ret->m_fn = std::move(fn); ret->autorelease(); ret->scheduleUpdateWithPriority(100); return ret; }
-        delete ret; return nullptr;
+        if (ret->init()) {
+            ret->m_fn = std::move(fn);
+            ret->autorelease();
+            ret->scheduleUpdateWithPriority(100);
+            return ret;
+        }
+        delete ret;
+        return nullptr;
     }
-    void update(float dt) override { if (m_fn) m_fn(dt); }
+
+    void update(float dt) override {
+        if (m_fn) m_fn(dt);
+    }
 };
 
 // ===============================================================
@@ -627,16 +710,22 @@ public:
 class $modify(BotPlayLayer, PlayLayer) {
     struct Fields {
         bool prevLayout = false;
-        int ticks = 0, rebuilds = 0;
-        bool needRebuild = false, geometryBuilt = false;
+        int ticks = 0;
+        int rebuilds = 0;
+        bool needRebuild = false;
+        bool geometryBuilt = false;
         float lastRebuildX = -1e9f;
 
-        float clickTimer = 0.f, holdTimer = 0.f;
+        float clickTimer = 0.f;
+        float holdTimer = 0.f;
         bool holding = false;
 
-        bool hitFlag = false, stepHookSeen = false;
-        int stepsSinceHit = 1000, deaths = 0;
-        long totalSteps = 0, deadSteps = 0;
+        bool hitFlag = false;
+        bool stepHookSeen = false;
+        int stepsSinceHit = 1000;
+        int deaths = 0;
+        long totalSteps = 0;
+        long deadSteps = 0;
         int labelTick = 0;
 
         DraggableNode* hud = nullptr;
@@ -644,26 +733,37 @@ class $modify(BotPlayLayer, PlayLayer) {
         extension::CCScale9Sprite* hudBg = nullptr;
 
         bool haveLast = false;
-        float lastX = 0.f, lastY = 0.f, vx = 5.193f, vy = 0.f;
+        float lastX = 0.f, lastY = 0.f;
+        float vx = 5.193f;
+        float vy = 0.f;
         int stepsThisTick = 0;
         float tpsEma = 240.f;
 
         bool stepInit = false;
         float stepPrevX = 0.f, stepPrevY = 0.f, stepPrevAbs = 0.f;
+        bool stepPrevGround = true, stepPrevFlip = false;
 
         CCDrawNode* traj = nullptr;
+
         bool  trajDirty = true;
         int   trajCounter = 0;
-        bool  trajPrevGround = true, trajPrevFlip = false;
+        bool  trajPrevGround = true;
+        bool  trajPrevFlip = false;
         float trajPrevVY = 0.f;
         int   trajPrevWaveDir = 1;
         bool  trajPrevWasWave = false;
 
         int botRelease = 0;
-        bool botHolding = false, havePlan = false;
-        float planX = 0.f, planDeadlineX = 0.f;
-        int planIdle = 0, cooldown = 0, retry = 0;
-        int lockIdx = -1, waveDir = 1;
+        bool botHolding = false;
+        bool havePlan = false;
+        float planX = 0.f;
+        float planDeadlineX = 0.f;
+        int planIdle = 0;
+        int cooldown = 0;
+        int planAge = 0;
+        int retry = 0;
+        int lockIdx = -1;
+        int waveDir = 1;
         CCLabelBMFont* status = nullptr;
         std::string lastStatus;
     };
@@ -672,38 +772,67 @@ class $modify(BotPlayLayer, PlayLayer) {
         float up = flip ? -1.f : 1.f;
         float ly = y * up;
         float floorL = flip ? -sim::ceilY : sim::floorY;
+
         if (std::abs((ly - sim::HALF) - floorL) < 1.5f) return true;
+
         bool onBlock = false;
         sim::forEachNear(x, [&](sim::Box const& b) {
-            if (b.kind != sim::Solid && b.kind != sim::Slope) return;
+            if (b.kind != sim::Solid) return;
             float by1 = flip ? -b.y0 : b.y1;
-            if (x + sim::HALF > b.x0 && x - sim::HALF < b.x1 && std::abs((ly - sim::HALF) - by1) < 1.5f) onBlock = true;
+            if (x + sim::HALF > b.x0 && x - sim::HALF < b.x1 &&
+                std::abs((ly - sim::HALF) - by1) < 1.5f) onBlock = true;
         });
         return onBlock;
     }
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+
+        // Drop geometry left over from the previous level
+        sim::boxes.clear();
+        sim::wide.clear();
+
         auto win = CCDirector::sharedDirector()->getWinSize();
         CCNode* ui = m_uiLayer ? static_cast<CCNode*>(m_uiLayer) : static_cast<CCNode*>(this);
 
         auto bg = extension::CCScale9Sprite::create("square02_small.png");
-        bg->setContentSize({45.f, 45.f}); bg->setOpacity(110);
+        bg->setContentSize({45.f, 45.f});
+        bg->setOpacity(110);
         if (auto icon = CCSprite::createWithSpriteFrameName("GJ_optionsBtn_001.png")) {
-            icon->setScale(0.9f); icon->setPosition(bg->getContentSize() / 2); bg->addChild(icon);
+            icon->setScale(0.9f);
+            icon->setPosition(bg->getContentSize() / 2);
+            bg->addChild(icon);
         }
-        if (auto btn = DraggableNode::create({45.f, 45.f}, "btn-x", "btn-y", nullptr, [] { BotMenu::create()->show(); })) {
-            bg->setPosition({22.5f, 22.5f}); btn->addChild(bg); btn->setVisualScaleTarget(bg);
-            btn->restorePosition({40.f, win.height - 40.f}); ui->addChild(btn, 1000);
+        if (auto btn = DraggableNode::create({45.f, 45.f}, "btn-x", "btn-y", nullptr,
+                                             [] { BotMenu::create()->show(); })) {
+            bg->setPosition({22.5f, 22.5f});
+            btn->addChild(bg);
+            btn->setVisualScaleTarget(bg);
+            btn->restorePosition({40.f, win.height - 40.f});
+            ui->addChild(btn, 1000);
         }
 
-        if (auto hud = DraggableNode::create({170.f, 26.f}, "hud-x", "hud-y", [] { return g.hudEdit; }, nullptr)) {
+        if (auto hud = DraggableNode::create({170.f, 26.f}, "hud-x", "hud-y",
+                                             [] { return g.hudEdit; }, nullptr)) {
             auto hbg = extension::CCScale9Sprite::create("square02_small.png");
-            hbg->setContentSize({170.f, 26.f}); hbg->setOpacity(120); hbg->setPosition({85.f, 13.f}); hud->addChild(hbg);
+            hbg->setContentSize({170.f, 26.f});
+            hbg->setOpacity(120);
+            hbg->setPosition({85.f, 13.f});
+            hud->addChild(hbg);
+
             auto label = CCLabelBMFont::create("Deaths: 0   Acc: 100.0%", "bigFont.fnt");
-            label->setScale(0.38f); label->setPosition({85.f, 13.f}); hud->addChild(label);
-            hud->restorePosition({win.width / 2.f, win.height - 48.f}); hud->setScale(g.hudScale); hud->setVisible(false);
-            ui->addChild(hud, 999); m_fields->hud = hud; m_fields->hudLabel = label; m_fields->hudBg = hbg;
+            label->setScale(0.38f);
+            label->setPosition({85.f, 13.f});
+            hud->addChild(label);
+
+            hud->restorePosition({win.width / 2.f, win.height - 48.f});
+            hud->setScale(g.hudScale);
+            hud->setVisible(false);
+            ui->addChild(hud, 999);
+
+            m_fields->hud = hud;
+            m_fields->hudLabel = label;
+            m_fields->hudBg = hbg;
         }
 
         if (m_objectLayer) {
@@ -713,18 +842,30 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
 
         auto status = CCLabelBMFont::create("", "bigFont.fnt");
-        status->setScale(0.35f); status->setOpacity(200); status->setPosition({win.width / 2.f, 14.f}); status->setVisible(false);
-        ui->addChild(status, 999); m_fields->status = status;
+        status->setScale(0.35f);
+        status->setOpacity(200);
+        status->setPosition({win.width / 2.f, 14.f});
+        status->setVisible(false);
+        ui->addChild(status, 999);
+        m_fields->status = status;
 
-        if (auto ticker = Ticker::create([this](float dt) { this->tickAll(dt); })) this->addChild(ticker);
+        if (auto ticker = Ticker::create([this](float dt) { this->tickAll(dt); })) {
+            this->addChild(ticker);
+        }
+
         return true;
     }
 
     void buildGeometry() {
         std::unordered_map<GameObject*, std::pair<float,float>> oldPos;
-        for (auto const& b : sim::boxes) if (b.src) oldPos[b.src] = {b.x0, b.y0};
+        for (auto const& b : sim::boxes) {
+            if (b.src) oldPos[b.src] = {b.x0, b.y0};
+        }
 
-        sim::boxes.clear(); sim::wide.clear(); sim::maxW = 30.f; sim::floorY = 90.f;
+        sim::boxes.clear();
+        sim::wide.clear();
+        sim::maxW = 30.f;
+        sim::floorY = 90.f;
         sim::nSolid = sim::nHazard = sim::nPad = sim::nOrb = sim::nPortal = 0;
         if (!m_objects) return;
 
@@ -734,8 +875,11 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
             if (!obj) continue;
+
             auto pos = obj->getPosition();
             if (pos.x < winX0 || pos.x > winX1) continue;
+
+            if (obj->m_objectType == GameObjectType::Slope) continue;
 
             int kind = -1;
             switch (obj->m_objectID) {
@@ -748,49 +892,72 @@ class $modify(BotPlayLayer, PlayLayer) {
                 case 1333: kind = sim::OrbRed;    break;
                 case 84:   kind = sim::OrbBlue;   break;
                 case 1022: kind = sim::OrbGreen;  break;
-                case 200:  kind = sim::PortalSpeed05; break;
-                case 201:  kind = sim::PortalSpeed1;  break;
-                case 202:  kind = sim::PortalSpeed2;  break;
-                case 203:  kind = sim::PortalSpeed3;  break;
-                case 1334: kind = sim::PortalSpeed4;  break;
                 default:
                     if (obj->m_objectType == GameObjectType::Hazard) kind = sim::Hazard;
                     else if (obj->m_objectType == GameObjectType::Solid) kind = sim::Solid;
-                    else if (obj->m_objectType == GameObjectType::Slope) kind = sim::Slope;
                     else if (obj->m_objectType == GameObjectType::InverseGravityPortal) kind = sim::PortalInverse;
                     else if (obj->m_objectType == GameObjectType::NormalGravityPortal) kind = sim::PortalNormal;
             }
             if (kind < 0) continue;
 
             CCRect r;
+
             if (sim::isOrb(kind)) {
-                r = obj->getObjectRect(); r.origin.x += 2.f; r.origin.y += 2.f; r.size.width -= 4.f; r.size.height -= 4.f;
+                r = obj->getObjectRect();
+                r.origin.x += 2.f; r.origin.y += 2.f; r.size.width -= 4.f; r.size.height -= 4.f;
             } else if (sim::isPad(kind)) {
-                r = obj->getObjectRect(); r.origin.y -= 2.f; r.size.height += 4.f;
+                r = obj->getObjectRect();
+                r.origin.y -= 2.f;
+                r.size.height += 4.f;
             } else if (kind == sim::Hazard) {
-                r = obj->getObjectRect(); float cx = r.origin.x + r.size.width * 0.5f;
-                r.origin.x = cx - 7.5f; r.size.width = 15.f; r.size.height = 15.f;
+                r = obj->getObjectRect();
+                // Centered shrink so upside-down / rotated spikes work.
+                // Big hazards (saws, large blocks) keep their real size.
+                if (r.size.width <= 30.f && r.size.height <= 30.f) {
+                    float cx = r.origin.x + r.size.width * 0.5f;
+                    float cy = r.origin.y + r.size.height * 0.5f;
+                    float w = std::min(r.size.width, 15.f);
+                    float h = std::min(r.size.height, 15.f);
+                    r = CCRect(cx - w * 0.5f, cy - h * 0.5f, w, h);
+                }
             } else {
                 r = obj->getObjectRect();
-                float mx = r.origin.x + r.size.width * 0.5f, my = r.origin.y + r.size.height * 0.5f;
-                bool valid = r.size.width >= 1.f && r.size.height >= 1.f && std::abs(mx - pos.x) < 80.f && std::abs(my - pos.y) < 80.f;
+                float mx = r.origin.x + r.size.width * 0.5f;
+                float my = r.origin.y + r.size.height * 0.5f;
+                bool valid = r.size.width >= 1.f && r.size.height >= 1.f &&
+                             std::abs(mx - pos.x) < 80.f && std::abs(my - pos.y) < 80.f;
                 if (!valid) {
                     auto bb = obj->boundingBox();
-                    if (sim::isPortal(kind)) r = CCRect(pos.x - 10.f, bb.origin.y, 20.f, bb.size.height);
-                    else r = bb;
+                    if (sim::isPortal(kind)) {
+                        r = CCRect(pos.x - 10.f, bb.origin.y, 20.f, bb.size.height);
+                    } else {
+                        r = bb;
+                    }
                 }
             }
             if (r.size.width <= 0.f || r.size.height <= 0.f) continue;
 
             bool isDynamic = false;
             auto oit = oldPos.find(obj);
-            if (oit != oldPos.end() && (std::abs(oit->second.first - r.origin.x) > 0.5f || std::abs(oit->second.second - r.origin.y) > 0.5f)) isDynamic = true;
-            if (isDynamic && (kind == sim::Solid || kind == sim::Hazard || kind == sim::Slope)) continue;
+            if (oit != oldPos.end()) {
+                if (std::abs(oit->second.first  - r.origin.x) > 0.5f ||
+                    std::abs(oit->second.second - r.origin.y) > 0.5f) {
+                    isDynamic = true;
+                }
+            }
+            if (isDynamic && (kind == sim::Solid || kind == sim::Hazard)) {
+                continue;
+            }
 
-            sim::Box b{r.origin.x, r.origin.y, r.origin.x + r.size.width, r.origin.y + r.size.height, kind, obj};
-            bool isWide = r.size.width > 120.f && (kind == sim::Solid || kind == sim::Hazard || kind == sim::Slope);
-            if (isWide) sim::wide.push_back(b);
-            else { sim::boxes.push_back(b); sim::maxW = std::max(sim::maxW, r.size.width); }
+            sim::Box b{r.origin.x, r.origin.y, r.origin.x + r.size.width,
+                       r.origin.y + r.size.height, kind, obj};
+            bool isWide = r.size.width > 120.f && (kind == sim::Solid || kind == sim::Hazard);
+            if (isWide) {
+                sim::wide.push_back(b);
+            } else {
+                sim::boxes.push_back(b);
+                sim::maxW = std::max(sim::maxW, r.size.width);
+            }
 
             if (kind == sim::Solid) sim::nSolid++;
             else if (kind == sim::Hazard) sim::nHazard++;
@@ -798,17 +965,24 @@ class $modify(BotPlayLayer, PlayLayer) {
             else if (sim::isPortal(kind)) sim::nPortal++;
             else sim::nOrb++;
         }
-        std::sort(sim::boxes.begin(), sim::boxes.end(), [](sim::Box const& a, sim::Box const& b) { return a.x0 < b.x0; });
+        std::sort(sim::boxes.begin(), sim::boxes.end(),
+                  [](sim::Box const& a, sim::Box const& b) { return a.x0 < b.x0; });
     }
 
     void pressJump(bool down) {
         this->handleButton(down, 1, true);
-        if (m_gameState.m_isDualMode && m_player2) this->handleButton(down, 1, false);
+        if (m_gameState.m_isDualMode && m_player2) {
+            this->handleButton(down, 1, false);
+        }
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (g.noclip) { m_fields->hitFlag = true; return; }
-        m_fields->haveLast = false; m_fields->vy = 0.f;
+        if (g.noclip) {
+            m_fields->hitFlag = true;
+            return;
+        }
+        m_fields->haveLast = false;
+        m_fields->vy = 0.f;
         PlayLayer::destroyPlayer(player, object);
     }
 
@@ -816,29 +990,63 @@ class $modify(BotPlayLayer, PlayLayer) {
         PlayLayer::resetLevel();
         auto f = m_fields.self();
         if (f->holding || f->botHolding) this->pressJump(false);
-        f->clickTimer = 0.f; f->holdTimer = 0.f; f->holding = false; f->botHolding = false;
-        f->botRelease = 0; f->havePlan = false; f->planIdle = 0; f->cooldown = 0; f->retry = 0; f->lockIdx = -1;
-        f->deaths = 0; f->totalSteps = 0; f->deadSteps = 0; f->stepsSinceHit = 1000; f->hitFlag = false;
-        f->stepInit = false; f->haveLast = false; f->trajDirty = true; f->trajCounter = 0;
-        f->trajPrevGround = true; f->trajPrevFlip = false; f->trajPrevVY = 0.f; f->trajPrevWaveDir = 1;
-        f->trajPrevWasWave = false; f->lastRebuildX = -1e9f;
-        sim::speedMul = 1.0f; // Reset speed
-        if (f->rebuilds < 2) { f->rebuilds++; f->needRebuild = true; }
+        f->clickTimer = 0.f;
+        f->holdTimer = 0.f;
+        f->holding = false;
+        f->botHolding = false;
+        f->botRelease = 0;
+        f->havePlan = false;
+        f->planIdle = 0;
+        f->cooldown = 0;
+        f->retry = 0;
+        f->planAge = 0;
+        f->lockIdx = -1;
+        f->deaths = 0;
+        f->totalSteps = 0;
+        f->deadSteps = 0;
+        f->stepsSinceHit = 1000;
+        f->hitFlag = false;
+        f->stepInit = false;
+        f->haveLast = false;
+
+        f->trajDirty = true;
+        f->trajCounter = 0;
+        f->trajPrevGround = true;
+        f->trajPrevFlip = false;
+        f->trajPrevVY = 0.f;
+        f->trajPrevWaveDir = 1;
+        f->trajPrevWasWave = false;
+        f->lastRebuildX = -1e9f;
+
+        if (f->rebuilds < 2) {
+            f->rebuilds++;
+            f->needRebuild = true;
+        }
         this->applyLayoutMode(g.layout);
     }
 
     void tickAll(float dt) {
         auto f = m_fields.self();
         f->ticks++;
+
         float px = m_player1 ? m_player1->getPositionX() : 0.f;
         bool movedFar = std::abs(px - f->lastRebuildX) > 200.f;
+        bool timedOut = (f->ticks % 120 == 0);
 
-        if ((!f->geometryBuilt && m_objects && m_objects->count() > 0) || f->ticks == 20 || f->needRebuild || (f->geometryBuilt && (movedFar || f->ticks % 120 == 0))) {
-            f->geometryBuilt = true; f->needRebuild = false; f->lastRebuildX = px;
-            this->buildGeometry(); f->lockIdx = -1; f->trajDirty = true;
+        if ((!f->geometryBuilt && m_objects && m_objects->count() > 0) ||
+            f->ticks == 20 || f->needRebuild ||
+            (f->geometryBuilt && (movedFar || timedOut))) {
+            f->geometryBuilt = true;
+            f->needRebuild = false;
+            f->lastRebuildX = px;
+            this->buildGeometry();
+            f->lockIdx = -1;
+            f->trajDirty = true;
         }
 
-        this->updateHud(); this->tickNoclipStats(); this->measure(dt);
+        this->updateHud();
+        this->tickNoclipStats();
+        this->measure(dt);
 
         if (!g.clicker && f->holding) { f->holding = false; this->pressJump(false); }
         if (!g.bot && f->botHolding) { f->botHolding = false; f->botRelease = 0; this->pressJump(false); }
@@ -846,119 +1054,210 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (g.bot) this->tickBot();
         else if (g.clicker) this->tickAutoclicker(dt);
 
-        this->drawTrajectory(); this->updateStatus();
+        this->drawTrajectory();
+        this->updateStatus();
 
-        if (g.layout != f->prevLayout) { f->prevLayout = g.layout; this->applyLayoutMode(g.layout); }
+        if (g.layout != f->prevLayout) {
+            f->prevLayout = g.layout;
+            this->applyLayoutMode(g.layout);
+        }
         if (g.layout) this->forceFlatColors();
     }
 
     void updateStatus() {
         auto f = m_fields.self();
         if (!f->status) return;
+
         bool show = g.bot || g.trajectory;
         f->status->setVisible(show);
         if (!show) return;
 
         std::string msg;
         if (!m_player1) msg = "no player";
-        else if (this->waveMode()) msg = "Wave mode";
-        else if (sim::boxes.empty() && sim::wide.empty()) msg = "No geometry found";
-        else msg = fmt::format("S{} H{} P{} O{} | jump {:.2f} | spd {:.1f}x | {}", sim::nSolid, sim::nHazard, sim::nPad, sim::nOrb, sim::jumpVel, sim::speedMul, g.bot ? "bot" : "traj");
+        else if (this->waveMode()) msg = "Wave mode (bot active)";
+        else if (!this->cubeMode()) msg = "Unsupported gamemode (cube + wave only)";
+        else if (sim::boxes.empty() && sim::wide.empty()) msg = "No level geometry found";
+        else msg = fmt::format("S{} H{} P{} O{} G{} | jump {:.2f}/{:.3f} | {}",
+                               sim::nSolid, sim::nHazard, sim::nPad, sim::nOrb, sim::nPortal,
+                               sim::jumpVel, sim::grav, g.bot ? "bot" : "traj");
 
-        if (msg != f->lastStatus) { f->lastStatus = msg; f->status->setString(msg.c_str()); }
+        if (msg != f->lastStatus) {
+            f->lastStatus = msg;
+            f->status->setString(msg.c_str());
+        }
     }
 
     void updateHud() {
         auto f = m_fields.self();
         if (!f->hud) return;
+
         auto win = CCDirector::sharedDirector()->getWinSize();
-        if (g.hudResetRequested) { g.hudResetRequested = false; g.hudScale = DEFAULT_HUD_SCALE; g.save(); f->hud->resetPosition({win.width / 2.f, win.height - 48.f}); }
-        f->hud->setScale(g.hudScale); f->hud->setVisible(g.counter || g.hudEdit);
+        if (g.hudResetRequested) {
+            g.hudResetRequested = false;
+            g.hudScale = DEFAULT_HUD_SCALE;
+            g.save();
+            f->hud->resetPosition({win.width / 2.f, win.height - 48.f});
+        }
+
+        f->hud->setScale(g.hudScale);
+        bool show = g.counter || g.hudEdit;
+        f->hud->setVisible(show);
+
         if (f->hudBg) f->hudBg->setColor(g.hudEdit ? ccColor3B{255, 220, 60} : ccColor3B{255, 255, 255});
     }
 
     void registerStep(bool fromStepHook) {
         auto f = m_fields.self();
-        bool hit = f->hitFlag; f->hitFlag = false;
-        if (!g.noclip) { f->stepsSinceHit = 1000; return; }
-        int gap = fromStepHook ? 6 : 2; f->totalSteps++;
+        bool hit = f->hitFlag;
+        f->hitFlag = false;
+
+        if (!g.noclip) {
+            f->stepsSinceHit = 1000;
+            return;
+        }
+
+        int gap = fromStepHook ? 6 : 2;
+        f->totalSteps++;
         if (hit) {
-            if (f->stepsSinceHit <= gap) f->deadSteps += f->stepsSinceHit;
-            else f->deaths++;
-            f->deadSteps++; f->stepsSinceHit = 0;
-        } else if (f->stepsSinceHit < 1000) f->stepsSinceHit++;
+            if (f->stepsSinceHit <= gap) {
+                f->deadSteps += f->stepsSinceHit;
+            } else {
+                f->deaths++;
+            }
+            f->deadSteps++;
+            f->stepsSinceHit = 0;
+        } else if (f->stepsSinceHit < 1000) {
+            f->stepsSinceHit++;
+        }
     }
 
     void onPhysicsStep() {
         auto f = m_fields.self();
-        f->stepHookSeen = true; f->stepsThisTick++;
+        f->stepHookSeen = true;
+        f->stepsThisTick++;
         this->registerStep(true);
     }
 
     void tickNoclipStats() {
         auto f = m_fields.self();
-        if (!f->stepHookSeen) this->registerStep(false);
+
+        if (!f->stepHookSeen) {
+            this->registerStep(false);
+        }
+
         if (f->hudLabel && ++f->labelTick >= 6) {
             f->labelTick = 0;
-            float acc = f->totalSteps > 0 ? 100.f * (1.f - static_cast<float>(f->deadSteps) / static_cast<float>(f->totalSteps)) : 100.f;
+            float acc = f->totalSteps > 0
+                ? 100.f * (1.f - static_cast<float>(f->deadSteps) / static_cast<float>(f->totalSteps))
+                : 100.f;
             f->hudLabel->setString(fmt::format("Deaths: {}   Acc: {:.1f}%", f->deaths, acc).c_str());
             float w = f->hudLabel->getContentSize().width;
-            f->hudLabel->setScale(std::min(0.38f, 160.f / std::max(w, 1.f)));
+            float sc = std::min(0.38f, 160.f / std::max(w, 1.f));
+            f->hudLabel->setScale(sc);
         }
     }
 
     void tickAutoclicker(float dt) {
         if (!m_player1 || m_player1->m_isDead) return;
         auto f = m_fields.self();
-        float interval = 1.f / g.cps, hold = std::min(0.04f, interval * 0.5f);
+        float interval = 1.f / g.cps;
+        float hold = std::min(0.04f, interval * 0.5f);
+
         if (f->holding) {
             f->holdTimer -= dt;
-            if (f->holdTimer <= 0.f) { f->holding = false; this->pressJump(false); }
+            if (f->holdTimer <= 0.f) {
+                f->holding = false;
+                this->pressJump(false);
+            }
             return;
         }
+
         f->clickTimer += dt;
-        if (f->clickTimer >= interval) { f->clickTimer = 0.f; f->holding = true; f->holdTimer = hold; this->pressJump(true); }
+        if (f->clickTimer >= interval) {
+            f->clickTimer = 0.f;
+            f->holding = true;
+            f->holdTimer = hold;
+            this->pressJump(true);
+        }
     }
 
     void measure(float dt) {
         if (!m_player1) return;
         auto f = m_fields.self();
-        float x = m_player1->getPositionX(), y = m_player1->getPositionY();
-        int steps = f->stepsThisTick; f->stepsThisTick = 0;
-        float frames60 = f->stepHookSeen ? static_cast<float>(steps) * (60.f / std::max(60.f, std::round(f->tpsEma / 60.f) * 60.f)) : dt * 60.f;
+        float x = m_player1->getPositionX();
+        float y = m_player1->getPositionY();
+
+        int steps = f->stepsThisTick;
+        f->stepsThisTick = 0;
+
+        float frames60;
+        if (f->stepHookSeen) {
+            if (dt > 0.0005f && dt < 0.1f) {
+                f->tpsEma = f->tpsEma * 0.98f + (static_cast<float>(steps) / dt) * 0.02f;
+            }
+            float tps = std::max(60.f, std::round(f->tpsEma / 60.f) * 60.f);
+            frames60 = static_cast<float>(steps) * (60.f / tps);
+        } else {
+            frames60 = dt * 60.f;
+        }
 
         if (f->haveLast && frames60 > 0.f) {
-            float dx = (x - f->lastX) / frames60, dy = (y - f->lastY) / frames60;
-            if (dx > 0.5f && dx < 30.f) f->vx = dx / std::max(0.1f, sim::speedMul);
+            float dx = (x - f->lastX) / frames60;
+            float dy = (y - f->lastY) / frames60;
+            if (dx > 0.5f && dx < 20.f) f->vx = dx;
             f->vy = std::clamp(dy, -30.f, 30.f);
         }
-        f->lastX = x; f->lastY = y; f->haveLast = true;
+        f->lastX = x;
+        f->lastY = y;
+        f->haveLast = true;
     }
 
-    bool cubeMode() { auto p = m_player1; return p && !p->m_isDead && !p->m_isShip && !p->m_isBird && !p->m_isBall && !p->m_isDart && !p->m_isRobot && !p->m_isSpider && !p->m_isSwing; }
-    bool waveMode() { auto p = m_player1; return p && !p->m_isDead && p->m_isDart; }
-    bool shipMode() { auto p = m_player1; return p && !p->m_isDead && p->m_isShip; }
-    bool ballMode() { auto p = m_player1; return p && !p->m_isDead && p->m_isBall; }
+    bool cubeMode() {
+        auto p = m_player1;
+        return p && !p->m_isDead && !p->m_isShip && !p->m_isBird && !p->m_isBall &&
+               !p->m_isDart && !p->m_isRobot && !p->m_isSpider && !p->m_isSwing;
+    }
+
+    bool waveMode() {
+        auto p = m_player1;
+        return p && !p->m_isDead && p->m_isDart;
+    }
 
     sim::S currentSimState() {
         auto f = m_fields.self();
         sim::S s;
         bool flip = m_player1->m_isUpsideDown;
         float up = flip ? -1.f : 1.f;
-        s.x = m_player1->getPositionX(); s.y = m_player1->getPositionY();
-        s.flip = flip; s.dead = false; s.lock = -1;
-        
-        if (this->shipMode()) s.mode = 1;
-        else if (this->ballMode()) s.mode = 2;
-        else s.mode = 0;
+        s.x = m_player1->getPositionX();
+        s.y = m_player1->getPositionY();
+        s.flip = flip;
+        s.dead = false;
+        s.lock = -1;
 
-        s.ground = (this->isOnLocalGround(s.x, s.y, flip) || m_player1->m_isOnGround) && std::abs(m_player1->m_yVelocity) < 2.0f;
+        bool geomGround = this->isOnLocalGround(s.x, s.y, flip);
+        bool isMoving = std::abs(m_player1->m_yVelocity) > 2.0f;
+        s.ground = (geomGround || m_player1->m_isOnGround) && !isMoving;
+
         s.vy = s.ground ? 0.f : f->vy * up;
 
         if (f->lockIdx >= 0) {
-            if (f->lockIdx < static_cast<int>(sim::boxes.size()) && sim::overlap(s.x, s.y, sim::ORB_HALF + 4.f, sim::boxes[f->lockIdx])) s.lock = f->lockIdx;
-            else f->lockIdx = -1;
+            if (f->lockIdx < static_cast<int>(sim::boxes.size()) &&
+                sim::overlap(s.x, s.y, sim::ORB_HALF + 4.f, sim::boxes[f->lockIdx])) {
+                s.lock = f->lockIdx;
+            } else {
+                f->lockIdx = -1;
+            }
         }
+        if (!s.ground && s.vy > 2.f && s.lock < 0) {
+            int found = -1;
+            sim::forEachNear(s.x, [&](sim::Box const& b) {
+                if (sim::isPad(b.kind) && sim::overlap(s.x, s.y, sim::ORB_HALF, b)) {
+                    found = sim::indexOf(b);
+                }
+            });
+            if (found >= 0) s.lock = found;
+        }
+
         return s;
     }
 
@@ -966,133 +1265,318 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto f = m_fields.self();
         if (!f->traj) return;
         if (!g.trajectory) { f->traj->clear(); return; }
-        if (!this->waveMode() && !this->cubeMode() && !this->shipMode() && !this->ballMode()) { f->traj->clear(); return; }
+
+        bool isWave = this->waveMode();
+        bool isCube = this->cubeMode();
+        if (!isWave && !isCube) { f->traj->clear(); return; }
 
         f->trajCounter++;
-        if (!f->trajDirty && f->trajCounter < 2) return;
-        f->trajCounter = 0; f->trajDirty = false; f->traj->clear();
 
-        if (this->waveMode()) {
-            auto s = currentSimState(); waveSim::S ws; ws.x = s.x; ws.y = s.y; ws.dir = f->vy >= 0 ? 1 : -1;
-            int H = sim::horizon(f->vx);
-            auto path = [&](bool click, ccColor4F col) {
-                waveSim::S w = ws; auto prev = CCPoint{w.x, w.y}; CCPoint end = prev; bool died = false;
-                for (int i = 0; i < H; i++) {
-                    waveSim::step(w, f->vx, click && i == 0);
-                    CCPoint p{w.x, w.y};
-                    if ((i % 2) == 0 || w.dead) { f->traj->drawSegment(prev, p, 1.4f, col); prev = p; }
-                    end = p; if (w.dead) { died = true; break; }
-                }
-                f->traj->drawDot(end, 5.f, died ? ccc4f(1.f, 0.2f, 0.2f, 1.f) : ccc4f(col.r, col.g, col.b, 0.85f));
-            };
-            path(false, ccc4f(1.f, 0.4f, 0.4f, 0.9f)); path(true, ccc4f(0.3f, 1.f, 0.4f, 0.9f));
+        bool stateChanged = false;
+        if (isWave) {
+            if (!f->trajPrevWasWave) stateChanged = true;
+            f->trajPrevWasWave = true;
+
+            float vyHint = m_player1->m_yVelocity;
+            if (std::abs(vyHint) < 0.5f) vyHint = static_cast<float>(f->waveDir);
+            int dir = (vyHint >= 0.f) ? +1 : -1;
+            f->waveDir = dir;
+            if (dir != f->trajPrevWaveDir) { stateChanged = true; f->trajPrevWaveDir = dir; }
         } else {
-            auto start = currentSimState();
-            int H = sim::horizon(f->vx);
-            auto drawPath = [&](bool pressNow, int pressFrame, ccColor4F col) {
-                auto s = start; auto prev = CCPoint{s.x, s.y}; CCPoint end = prev; bool died = false;
-                for (int i = 0; i < H; i++) {
-                    bool fire = pressNow ? (i == 0) : (i == pressFrame);
-                    sim::step(s, f->vx, fire);
-                    CCPoint p{s.x, s.y};
-                    if ((i % 2) == 0 || s.dead) { f->traj->drawSegment(prev, p, 1.4f, col); prev = p; }
-                    end = p; if (s.dead) { died = true; break; }
+            if (f->trajPrevWasWave) stateChanged = true;
+            f->trajPrevWasWave = false;
+
+            bool ground = m_player1->m_isOnGround;
+            bool flip = m_player1->m_isUpsideDown;
+            if (ground != f->trajPrevGround) stateChanged = true;
+            if (flip != f->trajPrevFlip) stateChanged = true;
+            if (std::abs(f->vy - f->trajPrevVY) > 3.f) stateChanged = true;
+            f->trajPrevGround = ground;
+            f->trajPrevFlip = flip;
+            f->trajPrevVY = f->vy;
+        }
+
+        if (!stateChanged && !f->trajDirty && f->trajCounter < 2) return;
+
+        f->trajCounter = 0;
+        f->trajDirty = false;
+        f->traj->clear();
+
+        if (isWave) {
+            this->drawWaveTrajectoryBody();
+        } else {
+            auto start = this->currentSimState();
+            this->drawCubeTrajectoryBody(start);
+        }
+    }
+
+    void drawCubeTrajectoryBody(sim::S const& start) {
+        auto f = m_fields.self();
+        int H = sim::horizon(f->vx);
+
+        auto drawPath = [&](bool pressNow, int pressFrame, ccColor4F col) {
+            auto s = start;
+            auto prev = CCPoint{s.x, s.y};
+            CCPoint end = prev;
+            bool died = false;
+
+            for (int i = 0; i < H; i++) {
+                bool fire = pressNow ? (i == 0) : (i == pressFrame);
+                sim::step(s, f->vx, fire);
+                CCPoint p{s.x, s.y};
+                if ((i % 2) == 0 || s.dead) {
+                    f->traj->drawSegment(prev, p, 1.4f, col);
+                    prev = p;
                 }
-                f->traj->drawDot(end, 5.f, died ? ccc4f(1.f, 0.2f, 0.2f, 1.f) : ccc4f(col.r, col.g, col.b, 0.85f));
-            };
-            drawPath(false, -1, ccc4f(1.f, 0.4f, 0.4f, 0.9f));
-            if (sim::canAct(start)) drawPath(true, -1, ccc4f(0.3f, 1.f, 0.4f, 0.9f));
-            if (g.bot && f->havePlan) {
-                int planFrame = static_cast<int>(std::round((f->planX - start.x) / f->vx));
-                if (planFrame >= 0) {
-                    planFrame = std::min(planFrame, H - 1);
-                    drawPath(false, planFrame, ccc4f(0.35f, 0.65f, 1.f, 0.9f));
-                    f->traj->drawDot(CCPoint{start.x + f->vx * planFrame, start.y}, 6.f, ccc4f(0.35f, 0.65f, 1.f, 1.f));
-                }
+                end = p;
+                if (s.dead) { died = true; break; }
+            }
+            f->traj->drawDot(end, 5.f,
+                died ? ccc4f(1.f, 0.2f, 0.2f, 1.f)
+                     : ccc4f(col.r, col.g, col.b, 0.85f));
+        };
+
+        drawPath(false, -1, ccc4f(1.f, 0.4f, 0.4f, 0.9f));
+        if (sim::canAct(start)) drawPath(true, -1, ccc4f(0.3f, 1.f, 0.4f, 0.9f));
+
+        if (g.bot && f->havePlan) {
+            int planFrame = static_cast<int>(std::round((f->planX - start.x) / f->vx));
+            if (planFrame >= 0) {
+                planFrame = std::min(planFrame, H - 1);
+                drawPath(false, planFrame, ccc4f(0.35f, 0.65f, 1.f, 0.9f));
+                f->traj->drawDot(CCPoint{start.x + f->vx * planFrame, start.y},
+                                 6.f, ccc4f(0.35f, 0.65f, 1.f, 1.f));
             }
         }
     }
 
+    bool waveHoldNow() {
+        auto f = m_fields.self();
+        if (g.bot) return f->botHolding;
+        bool flip = m_player1->m_isUpsideDown;
+        if (std::abs(f->vy) > 1.f) return (f->vy > 0.f) != flip;
+        return f->botHolding;
+    }
+
+    void drawWaveTrajectoryBody() {
+        auto f = m_fields.self();
+
+        waveSim::S s;
+        s.x = m_player1->getPositionX();
+        s.y = m_player1->getPositionY();
+        s.flip = m_player1->m_isUpsideDown;
+        s.hold = this->waveHoldNow();
+
+        int H = sim::horizon(f->vx);
+
+        auto path = [&](bool toggleNow, ccColor4F col) {
+            waveSim::S w = s;
+            bool h = toggleNow ? !s.hold : s.hold;
+            auto prev = CCPoint{w.x, w.y};
+            CCPoint end = prev;
+            bool died = false;
+
+            for (int i = 0; i < H; i++) {
+                waveSim::step(w, f->vx, h);
+                CCPoint p{w.x, w.y};
+                if ((i % 2) == 0 || w.dead) {
+                    f->traj->drawSegment(prev, p, 1.4f, col);
+                    prev = p;
+                }
+                end = p;
+                if (w.dead) { died = true; break; }
+            }
+            f->traj->drawDot(end, 5.f,
+                died ? ccc4f(1.f, 0.2f, 0.2f, 1.f)
+                     : ccc4f(col.r, col.g, col.b, 0.85f));
+        };
+
+        path(false, ccc4f(1.f, 0.4f, 0.4f, 0.9f));
+        path(true,  ccc4f(0.3f, 1.f, 0.4f, 0.9f));
+    }
+
     void botPress(sim::S const& s, int cooldown = 3) {
         auto f = m_fields.self();
-        if (!s.ground) f->lockIdx = sim::findOrb(s);
-        else f->lockIdx = -1;
-        f->havePlan = false; f->botHolding = true;
-        f->botRelease = 3; // HOLD FOR 3 FRAMES
-        f->cooldown = cooldown; f->trajDirty = true;
+        if (!s.ground) {
+            f->lockIdx = sim::findOrb(s);
+        } else {
+            f->lockIdx = -1;
+        }
+        f->havePlan = false;
+        f->botHolding = true;
+        f->botRelease = 2;
+        f->cooldown = cooldown;
+        f->trajDirty = true;
         this->pressJump(true);
     }
 
-    void tickBot() {
+    void tickWaveBot() {
         auto f = m_fields.self();
-        if (f->botRelease > 0 && --f->botRelease == 0) { f->botHolding = false; this->pressJump(false); }
-        if (f->cooldown > 0) f->cooldown--;
-        if (f->botHolding) return;
+        f->botRelease = 0;
+        f->havePlan = false;
+
+        if (!this->waveMode()) return;
         if (sim::boxes.empty() && sim::wide.empty()) return;
 
-        if (this->waveMode()) {
-            // Wave bot logic remains the same
-            float vyHint = m_player1->m_yVelocity;
-            if (std::abs(vyHint) < 0.5f) vyHint = static_cast<float>(f->waveDir);
-            f->waveDir = (vyHint >= 0.f) ? +1 : -1;
-            waveSim::S s; s.x = m_player1->getPositionX(); s.y = m_player1->getPositionY(); s.dir = f->waveDir;
-            
-            // Quick lookahead
-            waveSim::S probe = s; bool dies = false;
-            for (int i = 0; i < 30; i++) { waveSim::step(probe, f->vx, false); if (probe.dead) { dies = true; break; } }
-            if (!dies) return;
-            probe = s; waveSim::step(probe, f->vx, true); dies = false;
-            for (int i = 1; i < 30; i++) { waveSim::step(probe, f->vx, false); if (probe.dead) { dies = true; break; } }
-            if (!dies) { f->botHolding = true; f->botRelease = 1; this->pressJump(true); return; }
-            return;
-        }
+        waveSim::S s;
+        s.x = m_player1->getPositionX();
+        s.y = m_player1->getPositionY();
+        s.flip = m_player1->m_isUpsideDown;
+        s.hold = f->botHolding;
 
+        int H = std::min(sim::horizon(f->vx), waveSim::MAXH);
+        int mask = waveSim::plan(s, f->vx, H);
+        if (mask == 0) return; // no survivable line, keep doing what we're doing
+
+        bool cur = f->botHolding;
+        // keep the current input if it's safe, otherwise switch
+        bool want = (mask & (cur ? 2 : 1)) ? cur : !cur;
+        if (want != cur) {
+            f->botHolding = want;
+            this->pressJump(want);
+        }
+    }
+
+    void tickBot() {
+        if (this->waveMode()) { this->tickWaveBot(); return; }
+
+        auto f = m_fields.self();
+
+        if (f->botRelease > 0) {
+            if (--f->botRelease == 0) {
+                f->botHolding = false;
+                this->pressJump(false);
+            }
+        } else if (f->botHolding) {
+            // leftover hold (e.g. just left wave mode) - never get stuck holding
+            f->botHolding = false;
+            this->pressJump(false);
+        }
+        if (f->cooldown > 0) f->cooldown--;
+
+        if (!this->cubeMode() || (sim::boxes.empty() && sim::wide.empty())) return;
+        if (f->botHolding) return;
+
+        float vx = f->vx;
+        int H = sim::horizon(vx);
         auto s = this->currentSimState();
-        if (!s.ground && !this->shipMode() && sim::findOrb(s) < 0) { f->havePlan = false; f->trajDirty = true; return; }
+        bool act = sim::canAct(s);
 
-        sim::Planner p; p.vx = f->vx; p.H = sim::horizon(p.vx);
-        int d = -1;
-        { auto probe = s; for (int i = 0; i < p.H; i++) { sim::step(probe, p.vx, false); if (probe.dead) { d = i; break; } } }
+        int d = sim::deathFrame(s, vx, H);
+        if (d < 0) { f->havePlan = false; return; } // nothing to avoid
 
+        // Re-plan every few ticks so a bad velocity estimate can't hold a stale plan forever
         if (f->havePlan) {
-            if (d < 0) { if (++f->planIdle > 2) { f->havePlan = false; f->trajDirty = true; } return; }
-            f->planIdle = 0;
-            if (sim::canAct(s) && s.x + p.vx * 0.5f >= f->planX) { this->botPress(s); return; }
+            if (++f->planAge >= 4 || s.x > f->planDeadlineX) f->havePlan = false;
+        }
+        if (f->havePlan) {
+            // press at the planned spot, or immediately if death is about to happen
+            if (act && (s.x + vx * 0.5f >= f->planX || d <= 1)) this->botPress(s);
             return;
         }
-        if (d < 0) return;
         if (f->cooldown > 0) return;
 
-        // BFS Pathfinding
-        bool shouldPress = false;
-        p.budget = 5000;
-        if (p.survive(s, 0, shouldPress) && shouldPress) {
-            this->botPress(s);
+        // Find the widest window of frames where a press survives.
+        auto findWindow = [&](float margin, float& aimX, float& lastX) -> bool {
+            sim::hazMargin = margin;
+            struct Reset { ~Reset() { sim::hazMargin = 0.f; } } reset;
+
+            int dm = sim::deathFrame(s, vx, H);
+            if (dm < 0) return false;
+
+            sim::Planner p;
+            p.vx = vx;
+            p.H = H;
+
+            for (int extra : {0, 2}) { // 0 = one press is enough, 2 = allow follow-up presses
+                int bestFirst = -1, bestLast = -1, runFirst = -1;
+                auto w = s;
+                for (int k = 0; k <= dm; k++) {
+                    if (!sim::canAct(w)) {
+                        runFirst = -1;
+                    } else if (extra == 0 || (k & 1) == 0) {
+                        auto j = w;
+                        sim::step(j, vx, true);
+                        p.budget = extra == 0 ? 3000 : 5000;
+                        if (!j.dead && p.survive(j, 1, extra)) {
+                            if (runFirst < 0) runFirst = k;
+                            if (bestFirst < 0 || (k - runFirst) >= (bestLast - bestFirst)) {
+                                bestFirst = runFirst;
+                                bestLast = k;
+                            }
+                        } else {
+                            runFirst = -1;
+                        }
+                    }
+                    sim::step(w, vx, false);
+                    if (w.dead) break;
+                }
+                if (bestFirst >= 0) {
+                    aimX = s.x + vx * (bestFirst + (bestLast - bestFirst) * 0.5f);
+                    lastX = s.x + vx * bestLast;
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        float aimX = 0.f, lastX = 0.f;
+        // First try with extra clearance around hazards, then fall back to exact hitboxes
+        bool ok = findWindow(3.f, aimX, lastX) || findWindow(0.f, aimX, lastX);
+
+        if (!ok) {
+            if (act && d <= 3) this->botPress(s, 12); // last-ditch jump
+            return;
         }
+
+        if (act && s.x + vx * 0.5f >= aimX) {
+            this->botPress(s);
+            return;
+        }
+
+        f->havePlan = true;
+        f->planX = aimX;
+        f->planDeadlineX = lastX + vx * 0.5f;
+        f->planIdle = 0;
+        f->planAge = 0;
+        f->trajDirty = true;
     }
 
     void applyLayoutMode(bool enable) {
         if (m_objects) {
             for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
-                if (obj && obj->m_objectType == GameObjectType::Decoration) obj->setVisible(!enable);
+                if (obj && obj->m_objectType == GameObjectType::Decoration) {
+                    obj->setVisible(!enable);
+                }
             }
         }
         if (!enable) {
             if (m_background) m_background->setColor({255, 255, 255});
-            if (m_groundLayer) { m_groundLayer->updateGround01Color({255, 255, 255}); m_groundLayer->updateGround02Color({255, 255, 255}); }
+            if (m_groundLayer) {
+                m_groundLayer->updateGround01Color({255, 255, 255});
+                m_groundLayer->updateGround02Color({255, 255, 255});
+            }
         }
     }
 
     void forceFlatColors() {
         if (m_background) m_background->setColor({40, 62, 255});
-        if (m_groundLayer) { m_groundLayer->updateGround01Color({25, 40, 170}); m_groundLayer->updateGround02Color({25, 40, 170}); }
+        if (m_groundLayer) {
+            m_groundLayer->updateGround01Color({25, 40, 170});
+            m_groundLayer->updateGround02Color({25, 40, 170});
+        }
     }
 };
 
+// ===============================================================
+// Per-physics-step hook
+// ===============================================================
 class $modify(StepPlayer, PlayerObject) {
     void update(float dt) {
         if (auto pl = PlayLayer::get()) {
-            if (pl->m_player1 == this) static_cast<BotPlayLayer*>(pl)->onPhysicsStep();
+            if (pl->m_player1 == this) {
+                static_cast<BotPlayLayer*>(pl)->onPhysicsStep();
+            }
         }
         PlayerObject::update(dt);
     }
