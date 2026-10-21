@@ -4,30 +4,29 @@
 
 using namespace geode::prelude;
 
-// --- Simple variables to hold the state of your cheats ---
 bool g_noclipEnabled = false;
 bool g_autoClickerEnabled = false;
-bool g_layoutModeEnabled = false; // Placeholder for the layout feature
+bool g_layoutModeEnabled = false;
 
-// --- The Popup Menu Class ---
-class MyBotMenu : public Popup<> {
+// Updated for Geode v5: No more angle brackets <>
+class MyBotMenu : public Popup { 
 protected:
-    bool setup() override {
-        // Set the popup title and size
-        this->setTitle("Bot Menu");
-        this->setContentSize({280.f, 180.f});
+    // Updated for Geode v5: No arguments in init()
+    bool init() override { 
+        // We set the size here instead
+        if (!Popup::init(280.f, 180.f)) return false;
 
-        // Create a menu to hold our toggle buttons
+        this->setTitle("Bot Menu");
+
         auto menu = CCMenu::create();
         menu->setPosition({0, 0});
-        this->addChild(menu);
+        // Updated for Geode v5: Add to m_mainLayer instead of 'this'
+        this->m_mainLayer->addChild(menu); 
 
-        // Helper lambda to create a toggle button
         auto createToggle = [&](const char* text, bool& value, const CCPoint& pos) {
             auto label = CCLabelBMFont::create(text, "bigFont.fnt");
             label->setScale(0.6f);
             
-            // Using a standard checkbox sprite from the game
             auto spriteOn = CCSprite::createWithSpriteFrameName("GJ_checkOn_001.png");
             auto spriteOff = CCSprite::createWithSpriteFrameName("GJ_checkOff_001.png");
             
@@ -35,8 +34,7 @@ protected:
                 spriteOff, spriteOn, this, menu_selector(MyBotMenu::onToggle)
             );
             toggleBtn->setPosition(pos);
-            toggleBtn->toggle(value); // Set initial state
-            // We store a pointer to the bool in the button's user data
+            toggleBtn->toggle(value);
             toggleBtn->setUserData(&value); 
             menu->addChild(toggleBtn);
 
@@ -44,7 +42,6 @@ protected:
             menu->addChild(label);
         };
 
-        // Add the toggles
         createToggle("Noclip", g_noclipEnabled, {60.f, 100.f});
         createToggle("Autoclicker", g_autoClickerEnabled, {60.f, 60.f});
         createToggle("Layout Mode", g_layoutModeEnabled, {60.f, 20.f});
@@ -57,7 +54,7 @@ protected:
         if (toggle) {
             bool* valuePtr = static_cast<bool*>(toggle->getUserData());
             if (valuePtr) {
-                *valuePtr = !toggle->isToggled(); // Update the global state
+                *valuePtr = !toggle->isToggled();
             }
         }
     }
@@ -74,25 +71,24 @@ public:
     }
 };
 
-// --- Hook into the Gameplay Layer ---
 class $modify(MyPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
-        // Create the button to open our menu
         auto menuBtnSprite = CCSprite::createWithSpriteFrameName("GJ_optionsBtn_001.png");
+        if (!menuBtnSprite) return true;
         menuBtnSprite->setScale(0.8f);
+        
         auto menuBtn = CCMenuItemSpriteExtra::create(
             menuBtnSprite, nullptr, this, menu_selector(MyPlayLayer::onOpenMenu)
         );
         
-        // Add it to the screen, positioned near the top-right
         auto winSize = CCDirector::sharedDirector()->getWinSize();
         menuBtn->setPosition({winSize.width - 30.f, winSize.height - 30.f});
         
         auto buttonMenu = CCMenu::create(menuBtn, nullptr);
         buttonMenu->setPosition({0, 0});
-        this->addChild(buttonMenu, 100); // High Z-order to appear on top
+        this->addChild(buttonMenu, 100);
 
         return true;
     }
@@ -101,21 +97,17 @@ class $modify(MyPlayLayer, PlayLayer) {
         MyBotMenu::create()->show();
     }
 
-    // --- Hook to apply Noclip ---
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         if (g_noclipEnabled) {
-            return; // Skip the original function, preventing death
+            return; // Stops you from dying
         }
         PlayLayer::destroyPlayer(player, object);
     }
 
-    // --- Hook for the Autoclicker logic ---
     void update(float dt) {
         PlayLayer::update(dt);
 
         if (g_autoClickerEnabled && m_player1) {
-            // This is a very basic autoclicker that spams the jump button.
-            // It doesn't check if the player is on the ground.
             m_player1->pushButton(PlayerButton::Jump);
             m_player1->releaseButton(PlayerButton::Jump);
         }
