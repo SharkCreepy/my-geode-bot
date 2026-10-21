@@ -73,7 +73,7 @@ namespace sim {
     inline int nSolid = 0, nHazard = 0, nPad = 0, nOrb = 0, nPortal = 0, nSlope = 0;
 
     constexpr float HALF = 15.f;
-    constexpr float HAZ_HALF = 13.f;
+    constexpr float HAZ_HALF = 14.f;
     constexpr float ORB_HALF = 12.f;
     constexpr float TERMINAL = -15.f;
     constexpr int SUB = 2;
@@ -261,7 +261,7 @@ namespace sim {
                                     : (right ? (b.y0 + Hh * t) : (b.y1 - Hh * t));
                                 
                                 if (!s.flip) {
-                                    if (s.y - HALF < surfY - 2.f) {
+                                    if (s.y + HALF < surfY) {
                                         s.dead = true; 
                                     } else {
                                         s.y = surfY + HALF;
@@ -269,7 +269,7 @@ namespace sim {
                                         s.ground = true;
                                     }
                                 } else {
-                                    if (s.y + HALF > surfY + 2.f) {
+                                    if (s.y - HALF > surfY) {
                                         s.dead = true;
                                     } else {
                                         s.y = surfY - HALF;
@@ -1264,7 +1264,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool ok = findWindow(0.f, aimX, lastX);
 
         if (!ok) {
-            if (act && d <= 3) this->botPress(s, 6);
+            // If no safe jump is found but we are about to die, panic jump
+            if (act && d >= 0 && d <= 10) this->botPress(s, 6);
             return;
         }
 
