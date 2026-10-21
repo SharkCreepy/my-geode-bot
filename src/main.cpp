@@ -101,17 +101,17 @@ namespace sim {
         KindCount
     };
 
-    struct Box { float x0, y0, x1, y1; int kind; GameObject* src = nullptr; int corner = 0; };
+    struct Box { float x0, y0, x1, y1; int kind; GameObject* src = nullptr; int corner = 0; bool circular = false; };
 
     inline std::vector<Box> boxes;
     inline std::vector<Box> wide;
     inline float maxW = 30.f;
     inline float floorY = 90.f;
-    inline float ceilY = 600.f; // Give a little extra headroom
+    inline float ceilY = 600.f;
     inline int nSolid = 0, nHazard = 0, nPad = 0, nOrb = 0, nPortal = 0, nSlope = 0;
 
     constexpr float HALF = 15.f;
-    constexpr float HAZ_HALF = 11.f; // Slightly forgiving spike hitbox
+    constexpr float HAZ_HALF = 11.f;
     constexpr float ORB_HALF = 12.f;
     constexpr float TERMINAL = -15.f;
     constexpr int SUB = 2;
@@ -119,7 +119,7 @@ namespace sim {
     inline float jumpVel = 11.180032f;
     inline float grav = 0.958199f;
     inline float portalMul = 0.5f;
-    inline float hazMargin = 0.f; // extra hazard clearance, used by the bot when planning
+    inline float hazMargin = 0.f;
 
     inline float launch[KindCount] = {
         0.f, 0.f, 0.f, 0.f,
@@ -140,11 +140,39 @@ namespace sim {
     inline bool isPortal(int k) { return k == PortalNormal || k == PortalInverse; }
     inline bool flipsGravity(int k) { return k == PadBlue || k == OrbBlue || k == OrbGreen; }
 
+    inline bool isSawId(int id) {
+        switch (id) {
+            case 88: case 89: case 98:
+            case 183: case 184: case 185: case 186:
+            case 675: case 676: case 677: case 678: case 679: case 680:
+            case 685: case 686:
+            case 2586: case 3604: case 5005:
+                return true;
+            default: return false;
+        }
+    }
+
     inline bool overlap(float x, float y, float h, Box const& b) {
         return x + h > b.x0 && x - h < b.x1 && y + h > b.y0 && y - h < b.y1;
     }
 
-    // Right-triangle slope: b is the bounding box, b.corner (bit0 = right, bit1 = top) is the right-angle corner.
+    inline bool circleOverlapBox(float px, float py, float ph, float cx, float cy, float r) {
+        float nx = std::clamp(cx, px - ph, px + ph);
+        float ny = std::clamp(cy, py - ph, py + ph);
+        float dx = cx - nx, dy = cy - ny;
+        return dx * dx + dy * dy < r * r;
+    }
+
+    inline bool hitsHazard(float x, float y, float half_, float margin, Box const& b) {
+        if (b.circular) {
+            float cx = (b.x0 + b.x1) * 0.5f;
+            float cy = (b.y0 + b.y1) * 0.5f;
+            float r = std::min(b.x1 - b.x0, b.y1 - b.y0) * 0.42f + margin;
+            return circleOverlapBox(x, y, half_, cx, cy, r);
+        }
+        return overlap(x, y, half_ + margin, b);
+    }
+
     inline bool slopeOverlap(float x, float y, float h, Box const& b) {
         if (!overlap(x, y, h, b)) return false;
         float W = std::max(b.x1 - b.x0, 1.f), H = std::max(b.y1 - b.y0, 1.f);
@@ -192,7 +220,6 @@ namespace sim {
         if (s.dead) return;
 
         if (press) {
-            // ORB PRIORITY: Check for orbs first, even if on the ground
             int o = findOrb(s);
             if (o >= 0) {
                 activate(s, boxes[o], o);
@@ -245,7 +272,7 @@ namespace sim {
                 float u = s.flip ? -1.f : 1.f;
                 switch (b.kind) {
                     case Hazard:
-                        if (overlap(s.x, s.y, HAZ_HALF + hazMargin, b)) s.dead = true;
+                        if (hitsHazard(s.x, s.y, HAZ_HALF, hazMargin, b)) s.dead = true;
                         break;
                     case Solid:
                         if (overlap(s.x, s.y, HALF, b)) {
@@ -260,6 +287,40 @@ namespace sim {
                             }
                         }
                         break;
+                    case Slope: {
+                        if (overlap(s.x, s.y, HALF, b)) {
+                            float W = b.x1 - b.x0, Hh = b.y1 - b.y0;
+                            if (W > 1.f && Hh > 1.f) {
+                                float t = (s.x - b.x0) / W;
+                                bool right = (b.corner & 1) != 0;
+                                bool top   = (b.corner & 2) != 0;
+                                float surfY = top
+                                    ? (right ? (b.y1 - Hh * t) : (b.y0 + Hh * t))
+                                    : (right ? (b.y0 + Hh * t) : (b.y1 - Hh * t));
+                                
+                                if (!s.flip) {
+                                    if (s.y - HALF < surfY - 2.f) {
+                                        s.dead = true; // Hit from below
+                                    } else {
+                                        s.y = surfY + HALF;
+                                        if (s.vy < 0.f) s.vy = 0.f;
+                                        s.ground = true;
+                                    }
+                                } else {
+                                    if (s.y + HALF > surfY + 2.f) {
+                                        s.dead = true;
+                                    } else {
+                                        s.y = surfY - HALF;
+                                        if (s.vy > 0.f) s.vy = 0.f;
+                                        s.ground = true;
+                                    }
+                                }
+                            } else {
+                                s.dead = true;
+                            }
+                        }
+                        break;
+                    }
                     case PortalNormal:
                     case PortalInverse: {
                         bool target = (b.kind == PortalInverse);
@@ -340,9 +401,10 @@ namespace sim {
 // Wave physics (hold = up, release = down; flipped gravity inverts)
 // ===============================================================
 namespace waveSim {
-    constexpr float HALF = 6.f;      // wave hitbox is much smaller than the cube's - tweak if needed
-    constexpr float HAZ_HALF = 6.f;
-    constexpr int MAXH = 64;
+    constexpr float HALF = 4.f;       // Tighter hitbox
+    constexpr float HAZ_HALF = 4.f;   // Tighter hazard check
+    constexpr int SUB = 4;            // Finer sub-steps
+    constexpr int MAXH = 80;          // More lookahead
 
     struct S {
         float x = 0.f, y = 0.f;
@@ -358,7 +420,6 @@ namespace waveSim {
         s.hold = hold;
         int dir = dirOf(hold, s.flip);
 
-        constexpr int SUB = 2;
         constexpr float dt = 1.f / SUB;
         for (int i = 0; i < SUB && !s.dead; i++) {
             s.x += vx * dt;
@@ -369,7 +430,7 @@ namespace waveSim {
             sim::forEachNear(s.x, [&](sim::Box const& b) {
                 if (s.dead) return;
                 if (b.kind == sim::Hazard) {
-                    if (sim::overlap(s.x, s.y, HAZ_HALF, b)) s.dead = true;
+                    if (sim::hitsHazard(s.x, s.y, HAZ_HALF, 0.f, b)) s.dead = true;
                 } else if (b.kind == sim::Solid) {
                     if (sim::overlap(s.x, s.y, HALF, b)) s.dead = true;
                 } else if (b.kind == sim::Slope) {
@@ -381,13 +442,11 @@ namespace waveSim {
 
     struct Node {
         S s;
-        int n = 0;          // y lattice index (wave moves exactly +-vx per frame)
-        uint8_t first = 0;  // which first actions lead here: bit0 = release, bit1 = hold
+        int n = 0;          
+        uint8_t first = 0;  
         bool valid = false;
     };
 
-    // Returns a bitmask of first actions that survive the longest.
-    // bit0 = release, bit1 = hold. 0 = nothing survives.
     inline int plan(S start, float vx, int H) {
         H = std::min(H, MAXH);
         constexpr int N = (2 * MAXH + 1) * 2;
@@ -728,8 +787,6 @@ public:
 // ===============================================================
 // PlayLayer hook
 // ===============================================================
-// Corner of the slope's bounding box that holds the right angle (bit0 = right, bit1 = top).
-// -1 = rotated by something that isn't a multiple of 90 degrees (skipped).
 static int slopeCorner(GameObject* obj) {
     float q90 = obj->getRotation() / 90.f;
     if (std::abs(q90 - std::round(q90)) > 0.03f) return -1;
@@ -801,6 +858,10 @@ class $modify(BotPlayLayer, PlayLayer) {
         int waveDir = 1;
         CCLabelBMFont* status = nullptr;
         std::string lastStatus;
+
+        float lastDeathX = -1e9f;
+        int   lastDeathJumpBit = 0;
+        float lastPressX = -1e9f;
     };
 
     bool isOnLocalGround(float x, float y, bool flip) {
@@ -808,22 +869,37 @@ class $modify(BotPlayLayer, PlayLayer) {
         float ly = y * up;
         float floorL = flip ? -sim::ceilY : sim::floorY;
 
-        if (std::abs((ly - sim::HALF) - floorL) < 1.5f) return true;
+        if (std::abs((ly - sim::HALF) - floorL) < 2.5f) return true;
 
         bool onBlock = false;
         sim::forEachNear(x, [&](sim::Box const& b) {
             if (b.kind != sim::Solid) return;
             float by1 = flip ? -b.y0 : b.y1;
-            if (x + sim::HALF > b.x0 && x - sim::HALF < b.x1 &&
-                std::abs((ly - sim::HALF) - by1) < 1.5f) onBlock = true;
+            if (x + sim::HALF > b.x0 && x - sim::HALF < b.x1 + 2.0f && 
+                std::abs((ly - sim::HALF) - by1) < 3.0f) onBlock = true;
         });
-        return onBlock;
+        
+        bool onSlope = false;
+        if (!onBlock) {
+            sim::forEachNear(x, [&](sim::Box const& b) {
+                if (onSlope || b.kind != sim::Slope) return;
+                if (x < b.x0 || x > b.x1) return;
+                float W = b.x1 - b.x0, Hh = b.y1 - b.y0;
+                if (W < 1.f || Hh < 1.f) return;
+                float t = (x - b.x0) / W;
+                bool right = (b.corner & 1) != 0;
+                bool top   = (b.corner & 2) != 0;
+                if (top) return;   
+                float surfY = right ? (b.y0 + Hh * t) : (b.y1 - Hh * t);
+                if (std::abs((ly - sim::HALF) - surfY) < 3.5f) onSlope = true;
+            });
+        }
+        return onBlock || onSlope;
     }
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
-        // Drop geometry left over from the previous level
         sim::boxes.clear();
         sim::wide.clear();
 
@@ -945,9 +1021,10 @@ class $modify(BotPlayLayer, PlayLayer) {
                 r.size.height += 4.f;
             } else if (kind == sim::Hazard) {
                 r = obj->getObjectRect();
-                // Centered shrink so upside-down / rotated spikes work.
-                // Big hazards (saws, large blocks) keep their real size.
-                if (r.size.width <= 30.f && r.size.height <= 30.f) {
+                bool isSaw = sim::isSawId(obj->m_objectID) ||
+                             (std::abs(r.size.width - r.size.height) < 3.f &&
+                              r.size.width >= 25.f);
+                if (!isSaw && r.size.width <= 30.f && r.size.height <= 30.f) {
                     float cx = r.origin.x + r.size.width * 0.5f;
                     float cy = r.origin.y + r.size.height * 0.5f;
                     float w = std::min(r.size.width, 15.f);
@@ -974,17 +1051,23 @@ class $modify(BotPlayLayer, PlayLayer) {
             bool isDynamic = false;
             auto oit = oldPos.find(obj);
             if (oit != oldPos.end()) {
-                if (std::abs(oit->second.first  - r.origin.x) > 0.5f ||
-                    std::abs(oit->second.second - r.origin.y) > 0.5f) {
+                if (std::abs(oit->second.first  - r.origin.x) > 2.0f ||
+                    std::abs(oit->second.second - r.origin.y) > 2.0f) {
                     isDynamic = true;
                 }
             }
-            if (isDynamic && (kind == sim::Solid || kind == sim::Hazard)) {
+            // Do NOT skip hazards. Only skip moving solids.
+            if (isDynamic && kind == sim::Solid) {
                 continue;
             }
 
             sim::Box b{r.origin.x, r.origin.y, r.origin.x + r.size.width,
                        r.origin.y + r.size.height, kind, obj};
+            if (kind == sim::Hazard) {
+                b.circular = sim::isSawId(obj->m_objectID) ||
+                             (std::abs(r.size.width - r.size.height) < 3.f &&
+                              r.size.width >= 25.f);
+            }
             if (kind == sim::Slope) {
                 int c = slopeCorner(obj);
                 if (c < 0) continue;
@@ -1017,6 +1100,12 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
+        auto f = m_fields.self();
+        if (player) {
+            float px = player->getPositionX();
+            f->lastDeathX = px;
+            f->lastDeathJumpBit = (std::abs(f->lastPressX - px) < 60.f) ? 1 : 0;
+        }
         if (g.noclip) {
             m_fields->hitFlag = true;
             return;
@@ -1057,6 +1146,10 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->trajPrevWaveDir = 1;
         f->trajPrevWasWave = false;
         f->lastRebuildX = -1e9f;
+
+        f->lastDeathX = -1e9f;
+        f->lastDeathJumpBit = 0;
+        f->lastPressX = -1e9f;
 
         if (f->rebuilds < 2) {
             f->rebuilds++;
@@ -1474,6 +1567,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         } else {
             f->lockIdx = -1;
         }
+        f->lastPressX = s.x;
         f->havePlan = false;
         f->botHolding = true;
         f->botRelease = 2;
@@ -1520,7 +1614,6 @@ class $modify(BotPlayLayer, PlayLayer) {
                 this->pressJump(false);
             }
         } else if (f->botHolding) {
-            // leftover hold (e.g. just left wave mode) - never get stuck holding
             f->botHolding = false;
             this->pressJump(false);
         }
@@ -1535,20 +1628,17 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool act = sim::canAct(s);
 
         int d = sim::deathFrame(s, vx, H);
-        if (d < 0) { f->havePlan = false; return; } // nothing to avoid
+        if (d < 0) { f->havePlan = false; return; }
 
-        // Re-plan every few ticks so a bad velocity estimate can't hold a stale plan forever
         if (f->havePlan) {
             if (++f->planAge >= 4 || s.x > f->planDeadlineX) f->havePlan = false;
         }
         if (f->havePlan) {
-            // press at the planned spot, or immediately if death is about to happen
             if (act && (s.x + vx * 0.5f >= f->planX || d <= 1)) this->botPress(s);
             return;
         }
         if (f->cooldown > 0) return;
 
-        // Find the widest window of frames where a press survives.
         auto findWindow = [&](float margin, float& aimX, float& lastX) -> bool {
             sim::hazMargin = margin;
             struct Reset { ~Reset() { sim::hazMargin = 0.f; } } reset;
@@ -1560,7 +1650,7 @@ class $modify(BotPlayLayer, PlayLayer) {
             p.vx = vx;
             p.H = H;
 
-            for (int extra : {0, 2}) { // 0 = one press is enough, 2 = allow follow-up presses
+            for (int extra : {0, 2}) {
                 int bestFirst = -1, bestLast = -1, runFirst = -1;
                 auto w = s;
                 for (int k = 0; k <= dm; k++) {
@@ -1569,7 +1659,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                     } else if (extra == 0 || (k & 1) == 0) {
                         auto j = w;
                         sim::step(j, vx, true);
-                        p.budget = extra == 0 ? 3000 : 5000;
+                        p.budget = extra == 0 ? 10000 : 15000;
                         if (!j.dead && p.survive(j, 1, extra)) {
                             if (runFirst < 0) runFirst = k;
                             if (bestFirst < 0 || (k - runFirst) >= (bestLast - bestFirst)) {
@@ -1593,11 +1683,18 @@ class $modify(BotPlayLayer, PlayLayer) {
         };
 
         float aimX = 0.f, lastX = 0.f;
-        // First try with extra clearance around hazards, then fall back to exact hitboxes
-        bool ok = findWindow(3.f, aimX, lastX) || findWindow(0.f, aimX, lastX);
+        bool nearDeath = std::abs(s.x - f->lastDeathX) < 50.f;
+        float margin = nearDeath ? 6.f : 3.f;
+        
+        bool ok = findWindow(margin, aimX, lastX);
+        if (!ok) ok = findWindow(0.f, aimX, lastX);
 
         if (!ok) {
-            if (act && d <= 3) this->botPress(s, 6); // last-ditch jump
+            if (act && d <= 3) this->botPress(s, 6);
+            return;
+        }
+
+        if (nearDeath && f->lastDeathJumpBit == 1 && act && d > 2) {
             return;
         }
 
