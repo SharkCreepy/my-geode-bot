@@ -465,6 +465,33 @@ class $modify(JumpPlayer, PlayerObject) {
 };
 
 // ===============================================================
+// Ticker: our own per-frame callback.
+// Hooking PlayLayer::update is unreliable (especially on mobile),
+// so a plain scheduled node drives everything instead.
+// ===============================================================
+class Ticker : public CCNode {
+protected:
+    std::function<void(float)> m_fn;
+
+public:
+    static Ticker* create(std::function<void(float)> fn) {
+        auto ret = new Ticker();
+        if (ret->init()) {
+            ret->m_fn = std::move(fn);
+            ret->autorelease();
+            ret->scheduleUpdate();
+            return ret;
+        }
+        delete ret;
+        return nullptr;
+    }
+
+    void update(float dt) override {
+        if (m_fn) m_fn(dt);
+    }
+};
+
+// ===============================================================
 // PlayLayer hook
 // ===============================================================
 class $modify(BotPlayLayer, PlayLayer) {
@@ -500,6 +527,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         int botRelease = 0;
         int windowWidth = 0;
         bool botHolding = false;
+        bool geometryBuilt = false;
+        CCLabelBMFont* status = nullptr;
     };
 
     // ---------- setup ----------
@@ -558,12 +587,21 @@ class $modify(BotPlayLayer, PlayLayer) {
             m_fields->traj = node;
         }
 
-        return true;
-    }
+        // ---- small status line (tells you why bot/trajectory might be idle) ----
+        auto status = CCLabelBMFont::create("", "bigFont.fnt");
+        status->setScale(0.35f);
+        status->setOpacity(200);
+        status->setPosition({win.width / 2.f, 14.f});
+        status->setVisible(false);
+        ui->addChild(status, 999);
+        m_fields->status = status;
 
-    void setupHasCompleted() {
-        PlayLayer::setupHasCompleted();
-        this->buildGeometry();
+        // ---- per-frame driver ----
+        if (auto ticker = Ticker::create([this](float dt) { this->tickAll(dt); })) {
+            this->addChild(ticker);
+        }
+
+        return true;
     }
 
     void buildGeometry() {
@@ -629,9 +667,14 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     // ---------- per-frame ----------
-    void update(float dt) {
-        PlayLayer::update(dt);
+    void tickAll(float dt) {
         auto f = m_fields.self();
+
+        // build level geometry once the objects exist
+        if (!f->geometryBuilt && m_objects && m_objects->count() > 0) {
+            f->geometryBuilt = true;
+            this->buildGeometry();
+        }
 
         this->updateHud();
         this->tickNoclipStats();
@@ -645,12 +688,30 @@ class $modify(BotPlayLayer, PlayLayer) {
         else if (g.clicker) this->tickAutoclicker(dt);
 
         this->drawTrajectory();
+        this->updateStatus();
 
         if (g.layout != f->prevLayout) {
             f->prevLayout = g.layout;
             this->applyLayoutMode(g.layout);
         }
         if (g.layout) this->forceFlatColors();
+    }
+
+    // ---------- status line ----------
+    void updateStatus() {
+        auto f = m_fields.self();
+        if (!f->status) return;
+
+        bool show = g.bot || g.trajectory;
+        f->status->setVisible(show);
+        if (!show) return;
+
+        std::string msg;
+        if (!m_player1) msg = "no player";
+        else if (!this->cubeMode()) msg = "Not in cube mode (bot + trajectory are cube only)";
+        else if (sim::boxes.empty()) msg = "No level geometry found";
+        else msg = fmt::format("{} objects | {}", sim::boxes.size(), g.bot ? "bot active" : "trajectory on");
+        f->status->setString(msg.c_str());
     }
 
     // ---------- HUD ----------
@@ -667,7 +728,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
 
         f->hud->setScale(g.hudScale);
-        bool show = (g.noclip && g.counter) || g.hudEdit;
+        bool show = g.counter || g.hudEdit;
         f->hud->setVisible(show);
 
         // yellow tint while in "Move HUD" mode so it's obvious it can be dragged
