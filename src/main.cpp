@@ -870,7 +870,8 @@ class $modify(BotPlayLayer, PlayLayer) {
             if (pos.x < winX0 || pos.x > winX1) continue;
 
             // Ignore slopes entirely (the sim is flat-rectangle based)
-            if (obj->m_objectType == GameObjectType::Slope || obj->m_objectType == GameObjectType::Slope2) continue;
+            // FIXED: Removed GameObjectType::Slope2 to fix compile error
+            if (obj->m_objectType == GameObjectType::Slope) continue;
 
             int kind = -1;
             switch (obj->m_objectID) {
