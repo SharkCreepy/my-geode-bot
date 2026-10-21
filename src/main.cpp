@@ -1,100 +1,123 @@
-/**
- * Include the Geode headers.
- */
 #include <Geode/Geode.hpp>
+#include <Geode/modify/PlayLayer.hpp>
+#include <Geode/ui/Popup.hpp>
 
-/**
- * Brings cocos2d and all Geode namespaces to the current scope.
- */
 using namespace geode::prelude;
 
-/**
- * `$modify` lets you extend and modify GD's classes.
- * To hook a function in Geode, simply $modify the class
- * and write a new function definition with the signature of
- * the function you want to hook.
- *
- * Here we use the overloaded `$modify` macro to set our own class name,
- * so that we can use it for button callbacks.
- *
- * Notice the header being included, you *must* include the header for
- * the class you are modifying, or you will get a compile error.
- *
- * Another way you could do this is like this:
- *
- * struct MyMenuLayer : Modify<MyMenuLayer, MenuLayer> {};
- */
-#include <Geode/modify/MenuLayer.hpp>
-class $modify(MyMenuLayer, MenuLayer) {
-	/**
-	 * Typically classes in GD are initialized using the `init` function, (though not always!),
-	 * so here we use it to add our own button to the bottom menu.
-	 *
-	 * Note that for all hooks, your signature has to *match exactly*,
-	 * `void init()` would not place a hook!
-	*/
-	bool init() {
-		/**
-		 * We call the original init function so that the
-		 * original class is properly initialized.
-		 */
-		if (!MenuLayer::init()) {
-			return false;
-		}
+// --- Simple variables to hold the state of your cheats ---
+bool g_noclipEnabled = false;
+bool g_autoClickerEnabled = false;
+bool g_layoutModeEnabled = false; // Placeholder for the layout feature
 
-		/**
-		 * You can use methods from the `geode::log` namespace to log messages to the console,
-		 * being useful for debugging and such. See this page for more info about logging:
-		 * https://docs.geode-sdk.org/tutorials/logging
-		*/
-		log::debug("Hello from my MenuLayer::init hook! This layer has {} children.", this->getChildrenCount());
+// --- The Popup Menu Class ---
+class MyBotMenu : public Popup<> {
+protected:
+    bool setup() override {
+        // Set the popup title and size
+        this->setTitle("Bot Menu");
+        this->setContentSize({280.f, 180.f});
 
-		/**
-		 * See this page for more info about buttons
-		 * https://docs.geode-sdk.org/tutorials/buttons
-		*/
-		auto myButton = CCMenuItemSpriteExtra::create(
-			CCSprite::createWithSpriteFrameName("GJ_likeBtn_001.png"),
-			this,
-			/**
-			 * Here we use the name we set earlier for our modify class.
-			*/
-			menu_selector(MyMenuLayer::onMyButton)
-		);
+        // Create a menu to hold our toggle buttons
+        auto menu = CCMenu::create();
+        menu->setPosition({0, 0});
+        this->addChild(menu);
 
-		/**
-		 * Here we access the `bottom-menu` node by its ID, and add our button to it.
-		 * Node IDs are a Geode feature, see this page for more info about it:
-		 * https://docs.geode-sdk.org/tutorials/nodetree
-		*/
-		auto menu = this->getChildByID("bottom-menu");
-		menu->addChild(myButton);
+        // Helper lambda to create a toggle button
+        auto createToggle = [&](const char* text, bool& value, const CCPoint& pos) {
+            auto label = CCLabelBMFont::create(text, "bigFont.fnt");
+            label->setScale(0.6f);
+            
+            // Using a standard checkbox sprite from the game
+            auto spriteOn = CCSprite::createWithSpriteFrameName("GJ_checkOn_001.png");
+            auto spriteOff = CCSprite::createWithSpriteFrameName("GJ_checkOff_001.png");
+            
+            auto toggleBtn = CCMenuItemToggler::create(
+                spriteOff, spriteOn, this, menu_selector(MyBotMenu::onToggle)
+            );
+            toggleBtn->setPosition(pos);
+            toggleBtn->toggle(value); // Set initial state
+            // We store a pointer to the bool in the button's user data
+            toggleBtn->setUserData(&value); 
+            menu->addChild(toggleBtn);
 
-		/**
-		 * The `_spr` string literal operator just prefixes the string with
-		 * your mod id followed by a slash. This is good practice for setting your own node ids.
-		*/
-		myButton->setID("my-button"_spr);
+            label->setPosition(pos + CCPoint{30.f, 0.f});
+            menu->addChild(label);
+        };
 
-		/**
-		 * We update the layout of the menu to ensure that our button is properly placed.
-		 * This is yet another Geode feature, see this page for more info about it:
-		 * https://docs.geode-sdk.org/tutorials/layouts
-		*/
-		menu->updateLayout();
+        // Add the toggles
+        createToggle("Noclip", g_noclipEnabled, {60.f, 100.f});
+        createToggle("Autoclicker", g_autoClickerEnabled, {60.f, 60.f});
+        createToggle("Layout Mode", g_layoutModeEnabled, {60.f, 20.f});
 
-		/**
-		 * We return `true` to indicate that the class was properly initialized.
-		 */
-		return true;
-	}
+        return true;
+    }
 
-	/**
-	 * This is the callback function for the button we created earlier.
-	 * The signature for button callbacks must always be the same,
-	 * return type `void` and taking a `CCObject*`.
-	*/
-	void onMyButton(CCObject*) {
-		FLAlertLayer::create("Geode", "Hello from my custom mod!", "OK")->show();
-	}
+    void onToggle(CCObject* sender) {
+        auto toggle = static_cast<CCMenuItemToggler*>(sender);
+        if (toggle) {
+            bool* valuePtr = static_cast<bool*>(toggle->getUserData());
+            if (valuePtr) {
+                *valuePtr = !toggle->isToggled(); // Update the global state
+            }
+        }
+    }
+
+public:
+    static MyBotMenu* create() {
+        auto ret = new MyBotMenu();
+        if (ret && ret->init()) {
+            ret->autorelease();
+            return ret;
+        }
+        delete ret;
+        return nullptr;
+    }
+};
+
+// --- Hook into the Gameplay Layer ---
+class $modify(MyPlayLayer, PlayLayer) {
+    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+
+        // Create the button to open our menu
+        auto menuBtnSprite = CCSprite::createWithSpriteFrameName("GJ_optionsBtn_001.png");
+        menuBtnSprite->setScale(0.8f);
+        auto menuBtn = CCMenuItemSpriteExtra::create(
+            menuBtnSprite, nullptr, this, menu_selector(MyPlayLayer::onOpenMenu)
+        );
+        
+        // Add it to the screen, positioned near the top-right
+        auto winSize = CCDirector::sharedDirector()->getWinSize();
+        menuBtn->setPosition({winSize.width - 30.f, winSize.height - 30.f});
+        
+        auto buttonMenu = CCMenu::create(menuBtn, nullptr);
+        buttonMenu->setPosition({0, 0});
+        this->addChild(buttonMenu, 100); // High Z-order to appear on top
+
+        return true;
+    }
+
+    void onOpenMenu(CCObject* sender) {
+        MyBotMenu::create()->show();
+    }
+
+    // --- Hook to apply Noclip ---
+    void destroyPlayer(PlayerObject* player, GameObject* object) {
+        if (g_noclipEnabled) {
+            return; // Skip the original function, preventing death
+        }
+        PlayLayer::destroyPlayer(player, object);
+    }
+
+    // --- Hook for the Autoclicker logic ---
+    void update(float dt) {
+        PlayLayer::update(dt);
+
+        if (g_autoClickerEnabled && m_player1) {
+            // This is a very basic autoclicker that spams the jump button.
+            // It doesn't check if the player is on the ground.
+            m_player1->pushButton(PlayerButton::Jump);
+            m_player1->releaseButton(PlayerButton::Jump);
+        }
+    }
 };
