@@ -1,6 +1,5 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
-#include <Geode/modify/GameObject.hpp>
 #include <Geode/ui/Popup.hpp>
 
 using namespace geode::prelude;
@@ -9,53 +8,68 @@ bool g_noclipEnabled = false;
 bool g_autoClickerEnabled = false;
 bool g_layoutModeEnabled = false;
 
-// --- Custom Draggable Button Class ---
-class DraggableButton : public CCMenuItemSpriteExtra {
+// --- Custom Draggable Button (works by handling touches directly) ---
+class DraggableButton : public CCNode {
 protected:
     bool m_isDragging = false;
     CCPoint m_startPos;
     CCPoint m_startTouch;
+    CCMenuItemSpriteExtra* m_button;
 
 public:
-    bool ccTouchBegan(CCTouch* touch, CCEvent* event) override {
-        if (!CCMenuItemSpriteExtra::ccTouchBegan(touch, event)) return false;
-        m_isDragging = false;
-        m_startPos = this->getPosition();
-        m_startTouch = touch->getLocation();
+    bool init(CCNode* normalSprite, CCObject* target, SEL_MenuHandler selector) {
+        if (!CCNode::init()) return false;
+
+        // Create the actual button so clicks still work
+        m_button = CCMenuItemSpriteExtra::create(normalSprite, nullptr, target, selector);
+        m_button->setPosition({0, 0});
+        this->addChild(m_button);
+
+        // Set up touch listener
+        auto listener = cocos2d::CCEventListenerTouchOneByOne::create();
+        listener->setSwallowTouches(true);
+        listener->onTouchBegan = [this](CCTouch* touch, CCEvent* event) {
+            auto location = touch->getLocation();
+            auto local = this->convertToNodeSpace(location);
+            auto size = this->getContentSize();
+            if (local.x >= 0 && local.x <= size.width && local.y >= 0 && local.y <= size.height) {
+                m_startPos = this->getPosition();
+                m_startTouch = location;
+                m_isDragging = false;
+                return true;
+            }
+            return false;
+        };
+        listener->onTouchMoved = [this](CCTouch* touch, CCEvent* event) {
+            auto location = touch->getLocation();
+            auto diff = location - m_startTouch;
+            if (std::abs(diff.x) > 5.f || std::abs(diff.y) > 5.f) {
+                m_isDragging = true;
+            }
+            if (m_isDragging) {
+                auto newPos = m_startPos + diff;
+                auto winSize = CCDirector::sharedDirector()->getWinSize();
+                newPos.x = std::clamp(newPos.x, 25.f, winSize.width - 25.f);
+                newPos.y = std::clamp(newPos.y, 25.f, winSize.height - 25.f);
+                this->setPosition(newPos);
+            }
+        };
+        listener->onTouchEnded = [this](CCTouch* touch, CCEvent* event) {
+            if (m_isDragging) {
+                m_isDragging = false;
+            } else {
+                // Simulate a click on the button if it was a tap
+                m_button->activate();
+            }
+        };
+        cocos2d::CCDirector::sharedDirector()->getTouchDispatcher()->addTargetedDelegate(listener, 0, true);
+
         return true;
     }
 
-    void ccTouchMoved(CCTouch* touch, CCEvent* event) override {
-        auto diff = touch->getLocation() - m_startTouch;
-        
-        // If we move more than 5 pixels, it's a drag, not a click
-        if (std::abs(diff.x) > 5.f || std::abs(diff.y) > 5.f) {
-            m_isDragging = true;
-        }
-
-        if (m_isDragging) {
-            auto newPos = m_startPos + diff;
-            auto winSize = CCDirector::sharedDirector()->getWinSize();
-            
-            // Clamp to screen so you can't drag it off-screen
-            newPos.x = std::clamp(newPos.x, 25.f, winSize.width - 25.f);
-            newPos.y = std::clamp(newPos.y, 25.f, winSize.height - 25.f);
-            
-            this->setPosition(newPos);
-        }
-    }
-
-    void ccTouchEnded(CCTouch* touch, CCEvent* event) override {
-        if (m_isDragging) {
-            m_isDragging = false; // Stop dragging, do NOT trigger the click
-        } else {
-            CCMenuItemSpriteExtra::ccTouchEnded(touch, event);
-        }
-    }
-
-    static DraggableButton* create(CCNode* normalSprite, CCNode* selectedSprite, CCObject* target, SEL_MenuHandler selector) {
+    static DraggableButton* create(CCNode* normalSprite, CCObject* target, SEL_MenuHandler selector) {
         auto ret = new DraggableButton();
-        if (ret && ret->init(normalSprite, selectedSprite, target, selector)) {
+        if (ret && ret->init(normalSprite, target, selector)) {
             ret->autorelease();
             return ret;
         }
@@ -136,7 +150,6 @@ class $modify(MyPlayLayer, PlayLayer) {
         auto menuBtnSprite = CCSprite::createWithSpriteFrameName("GJ_optionsBtn_001.png");
         if (!menuBtnSprite) return true;
         
-        // Make the button look a bit cooler with a scale and a subtle background
         menuBtnSprite->setScale(0.9f);
         auto bg = cocos2d::extension::CCScale9Sprite::create("square02_small.png");
         bg->setContentSize({45, 45});
@@ -145,15 +158,13 @@ class $modify(MyPlayLayer, PlayLayer) {
         menuBtnSprite->setPosition(bg->getContentSize() / 2);
 
         // Use our custom DraggableButton!
-        auto menuBtn = DraggableButton::create(bg, nullptr, this, menu_selector(MyPlayLayer::onOpenMenu));
+        auto menuBtn = DraggableButton::create(bg, this, menu_selector(MyPlayLayer::onOpenMenu));
         
         auto winSize = CCDirector::sharedDirector()->getWinSize();
         menuBtn->setPosition({40.f, winSize.height - 40.f});
         
-        auto buttonMenu = CCMenu::create(menuBtn, nullptr);
-        buttonMenu->setPosition({0, 0});
-        // Z-order 9999 ensures it renders ABOVE the pause button and everything else
-        this->addChild(buttonMenu, 9999); 
+        // Add the button directly to the layer (no CCMenu needed)
+        this->addChild(menuBtn, 9999); 
 
         return true;
     }
@@ -198,22 +209,10 @@ class $modify(MyPlayLayer, PlayLayer) {
         // 2. Change Background Color
         if (m_background) {
             if (enable) {
-                // Solid blue color for layout mode
                 m_background->setColor({40, 62, 255}); 
             } else {
-                // Reset to white (original colors)
                 m_background->setColor({255, 255, 255}); 
             }
-        }
-    }
-};
-
-// --- Hook GameObject to hide new decorations that spawn AFTER you toggle it ---
-class $modify(MyGameObject, GameObject) {
-    void addToLayer() {
-        GameObject::addToLayer();
-        if (g_layoutModeEnabled && this->m_objectType == GameObjectType::Decoration) {
-            this->setVisible(false);
         }
     }
 };
