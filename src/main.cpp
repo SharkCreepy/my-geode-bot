@@ -305,7 +305,7 @@ namespace sim {
     }
 
     inline int horizon(float vx) {
-        return std::clamp(static_cast<int>(700.f / std::max(vx, 1.f)), 70, 150);
+        return std::clamp(static_cast<int>(1000.f / std::max(vx, 1.f)), 100, 200);
     }
 
     inline int deathFrame(S s, float vx, int H) {
@@ -564,7 +564,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         CCDrawNode* traj = nullptr;
 
         bool  trajDirty = true;
-        int   trajCounter = 0;
         bool  trajPrevGround = true;
         bool  trajPrevFlip = false;
         float trajPrevVY = 0.f;
@@ -788,7 +787,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->haveLast = false;
 
         f->trajDirty = true;
-        f->trajCounter = 0;
         f->trajPrevGround = true;
         f->trajPrevFlip = false;
         f->trajPrevVY = 0.f;
@@ -953,35 +951,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool isCube = this->cubeMode();
         if (!isWave && !isCube) { f->traj->clear(); return; }
 
-        f->trajCounter++;
-
-        bool stateChanged = false;
-        if (isWave) {
-            if (!f->trajPrevWasWave) stateChanged = true;
-            f->trajPrevWasWave = true;
-
-            float vyHint = m_player1->m_yVelocity;
-            if (std::abs(vyHint) < 0.5f) vyHint = static_cast<float>(f->waveDir);
-            int dir = (vyHint >= 0.f) ? +1 : -1;
-            f->waveDir = dir;
-            if (dir != f->trajPrevWaveDir) { stateChanged = true; f->trajPrevWaveDir = dir; }
-        } else {
-            if (f->trajPrevWasWave) stateChanged = true;
-            f->trajPrevWasWave = false;
-
-            bool ground = m_player1->m_isOnGround;
-            bool flip = m_player1->m_isUpsideDown;
-            if (ground != f->trajPrevGround) stateChanged = true;
-            if (flip != f->trajPrevFlip) stateChanged = true;
-            if (std::abs(f->vy - f->trajPrevVY) > 3.f) stateChanged = true;
-            f->trajPrevGround = ground;
-            f->trajPrevFlip = flip;
-            f->trajPrevVY = f->vy;
-        }
-
-        if (!stateChanged && !f->trajDirty && f->trajCounter < 2) return;
-
-        f->trajCounter = 0;
         f->trajDirty = false;
         f->traj->clear();
         if (SHOW_SIM_BOXES) this->drawSimBoxes();
@@ -999,7 +968,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (!m_player1) return;
         float px = m_player1->getPositionX();
         auto draw = [&](sim::Box const& b) {
-            if (b.x1 < px - 120.f || b.x0 > px + 500.f) return;
+            if (b.x1 < px - 200.f || b.x0 > px + 1000.f) return;
             ccColor4F col = ccc4f(0.2f, 0.8f, 1.f, 0.8f);
             if (b.kind == sim::Hazard) col = ccc4f(1.f, 0.2f, 0.2f, 0.9f);
             else if (b.kind == sim::Slope) col = ccc4f(1.f, 1.f, 0.2f, 0.9f);
@@ -1214,7 +1183,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                     } else if (extra == 0 || (k & 1) == 0) {
                         auto j = w;
                         sim::step(j, vx, true);
-                        p.budget = extra == 0 ? 50000 : 15000;
+                        p.budget = extra == 0 ? 100000 : 20000; // Huge budget for single jump to avoid double jumping
                         if (!j.dead && p.survive(j, 1, extra)) {
                             if (runFirst < 0) runFirst = k;
                             if (bestFirst < 0 || (k - runFirst) >= (bestLast - bestFirst)) {
@@ -1229,8 +1198,8 @@ class $modify(BotPlayLayer, PlayLayer) {
                     if (w.dead) break;
                 }
                 if (bestFirst >= 0) {
-                    // Jump early but not immediately (prevents jumping too early).
-                    int jumpFrame = bestFirst + std::min(2, (bestLast - bestFirst) / 2);
+                    // Jump at the LAST possible moment in the safe window
+                    int jumpFrame = std::max(bestFirst, bestLast - 1);
                     aimX = s.x + vx * jumpFrame;
                     lastX = s.x + vx * bestLast;
                     return true;
