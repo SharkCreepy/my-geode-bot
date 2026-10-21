@@ -101,12 +101,11 @@ namespace sim {
     inline int nSolid = 0, nHazard = 0, nPad = 0, nOrb = 0, nPortal = 0;
 
     constexpr float HALF = 15.f;
-    constexpr float HAZ_HALF = 12.f; // Normal spike hitbox
+    constexpr float HAZ_HALF = 7.5f; // Accurate spike hitbox
     constexpr float ORB_HALF = 10.f; 
     constexpr float TERMINAL = -15.f;
     constexpr int SUB = 2;
 
-    // 100% HARDCODED PERFECT GEOMETRY DASH PHYSICS
     inline float jumpVel = 11.180032f;
     inline float grav = 0.958199f;
     inline float portalMul = 0.5f;
@@ -390,7 +389,6 @@ namespace waveSim {
 }
 
 $on_mod(Loaded) {
-    // FORCE standard physics and overwrite corrupted save data
     auto m = Mod::get();
     m->setSavedValue<float>("jumpVel", 11.180032f);
     m->setSavedValue<float>("grav", 0.958199f);
@@ -893,7 +891,10 @@ class $modify(BotPlayLayer, PlayLayer) {
             CCRect r;
 
             if (sim::isOrb(kind)) {
-                r = CCRect(pos.x - 15.f, pos.y - 15.f, 30.f, 30.f);
+                r = CCRect(pos.x + 15.f - 15.f, pos.y + 15.f - 15.f, 30.f, 30.f);
+            } else if (kind == sim::Hazard) {
+                // Real GD spike hitbox is exactly 15x15 at the bottom center
+                r = CCRect(pos.x + 7.5f, pos.y, 15.f, 15.f);
             } else {
                 r = obj->getObjectRect();
                 float mx = r.origin.x + r.size.width * 0.5f;
@@ -957,6 +958,9 @@ class $modify(BotPlayLayer, PlayLayer) {
             m_fields->hitFlag = true;
             return;
         }
+        // Reset velocity tracking to prevent weird gravity after death
+        m_fields->haveLast = false;
+        m_fields->vy = 0.f;
         PlayLayer::destroyPlayer(player, object);
     }
 
@@ -1207,10 +1211,10 @@ class $modify(BotPlayLayer, PlayLayer) {
         s.dead = false;
         s.lock = -1;
 
-        // Geometric ground check, overridden if moving upward
+        // STRICT ground check. If falling or rising fast, we are NOT on the ground.
         bool geomGround = this->isOnLocalGround(s.x, s.y, flip);
-        if (m_player1->m_yVelocity > 0.5f) geomGround = false; 
-        s.ground = geomGround || m_player1->m_isOnGround;
+        bool isMoving = std::abs(m_player1->m_yVelocity) > 2.0f;
+        s.ground = (geomGround || m_player1->m_isOnGround) && !isMoving;
 
         s.vy = s.ground ? 0.f : f->vy * up;
 
@@ -1398,7 +1402,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (f->botHolding) return;
 
         auto s = this->currentSimState();
-        // ABSOLUTE HARD STOP: Never press in mid-air unless there is an orb
+        
+        // Strict check: never press in mid-air without an orb
         if (!s.ground && sim::findOrb(s) < 0) {
             f->havePlan = false;
             return; 
@@ -1436,7 +1441,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto scan = [&](int extra, int& first, int& last) {
             first = last = -1;
             int runFirst = -1;
-            int scanEnd = d; // scan all the way to the death frame
+            int scanEnd = d;
             auto w = s;
             for (int k = 0; k <= scanEnd; k++) {
                 if (sim::canAct(w) && (extra == 0 || (k & 1) == 0)) {
@@ -1469,8 +1474,10 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         float firstX = s.x + p.vx * first;
         float lastX  = s.x + p.vx * last;
-        float aimX = lastX - p.vx * 1.0f;
-        if (aimX < firstX) aimX = firstX;
+        
+        // FIX: Aim for the EARLIEST possible frame to clear the spike
+        float aimX = firstX + p.vx * 0.5f; 
+        if (aimX > lastX) aimX = lastX; // Ensure we are still inside the safe window
 
         if (first == 0 && last <= 1) {
             this->botPress(s);
