@@ -103,7 +103,7 @@ namespace sim {
     inline std::vector<Box> wide;
     inline float maxW = 30.f;
     inline float floorY = 90.f;
-    inline float ceilY = 390.f;
+    inline float ceilY = 570.f;   // real GD ceiling
     inline int nSolid = 0, nHazard = 0, nPad = 0, nOrb = 0, nPortal = 0;
 
     constexpr float HALF = 15.f;
@@ -216,7 +216,10 @@ namespace sim {
                     s.vy = 0.f;
                     s.ground = true;
                 } else if (s.vy > 0.f && prevTop <= by0 + 1.f) {
-                    s.dead = true;
+                    // Underside of a solid: stop upward motion, don't die.
+                    ly = by0 - HALF;
+                    s.y = ly * up;
+                    s.vy = 0.f;
                 }
             });
             if (s.dead) break;
@@ -272,7 +275,7 @@ namespace sim {
     }
 
     inline int horizon(float vx) {
-        return std::clamp(static_cast<int>(900.f / std::max(vx, 1.f)), 60, 170);
+        return std::clamp(static_cast<int>(550.f / std::max(vx, 1.f)), 55, 120);
     }
 
     inline int deathFrame(S s, float vx, int H) {
@@ -344,7 +347,7 @@ namespace sim {
 }
 
 // ===============================================================
-// Wave physics (45° movement, click toggles vertical direction)
+// Wave physics (substepped, 45-degree)
 // ===============================================================
 namespace waveSim {
     constexpr float HALF = sim::HALF;
@@ -359,20 +362,26 @@ namespace waveSim {
     inline void step(S& s, float vx, bool click) {
         if (s.dead) return;
         if (click) s.dir = -s.dir;
-        s.x += vx;
-        s.y += s.dir * vx;
 
-        if (s.y - HALF < sim::floorY) { s.dead = true; return; }
-        if (s.y + HALF > sim::ceilY)  { s.dead = true; return; }
+        constexpr int SUB = 2;
+        constexpr float dt = 1.f / SUB;
 
-        sim::forEachNear(s.x, [&](sim::Box const& b) {
-            if (s.dead) return;
-            if (b.kind == sim::Hazard) {
-                if (sim::overlap(s.x, s.y, HAZ_HALF, b)) s.dead = true;
-            } else if (b.kind == sim::Solid) {
-                if (sim::overlap(s.x, s.y, HALF, b)) s.dead = true;
-            }
-        });
+        for (int i = 0; i < SUB && !s.dead; i++) {
+            s.x += vx * dt;
+            s.y += s.dir * vx * dt;
+
+            if (s.y - HALF < sim::floorY) { s.dead = true; return; }
+            if (s.y + HALF > sim::ceilY)  { s.dead = true; return; }
+
+            sim::forEachNear(s.x, [&](sim::Box const& b) {
+                if (s.dead) return;
+                if (b.kind == sim::Hazard) {
+                    if (sim::overlap(s.x, s.y, HAZ_HALF, b)) s.dead = true;
+                } else if (b.kind == sim::Solid) {
+                    if (sim::overlap(s.x, s.y, HALF, b)) s.dead = true;
+                }
+            });
+        }
     }
 
     inline bool dfs(S s, float vx, int H, int clicksLeft, int& budget, bool& clickNow) {
@@ -725,6 +734,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         int rebuilds = 0;
         bool needRebuild = false;
         bool geometryBuilt = false;
+        float lastRebuildX = -1e9f;
 
         float clickTimer = 0.f;
         float holdTimer = 0.f;
@@ -760,6 +770,17 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool stepPrevGround = true, stepPrevFlip = false;
 
         CCDrawNode* traj = nullptr;
+
+        // Trajectory cache
+        bool  trajDirty = true;
+        int   trajCounter = 0;
+        bool  trajPrevGround = true;
+        bool  trajPrevFlip = false;
+        float trajPrevVY = 0.f;
+        int   trajPrevWaveDir = 1;
+        bool  trajPrevWasWave = false;
+
+        // Bot
         int botRelease = 0;
         bool botHolding = false;
         bool havePlan = false;
@@ -769,6 +790,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         int cooldown = 0;
         int retry = 0;
         int lockIdx = -1;
+        int waveDir = 1;
         CCLabelBMFont* status = nullptr;
         std::string lastStatus;
     };
@@ -870,8 +892,15 @@ class $modify(BotPlayLayer, PlayLayer) {
         sim::nSolid = sim::nHazard = sim::nPad = sim::nOrb = sim::nPortal = 0;
         if (!m_objects) return;
 
+        float px = m_player1 ? m_player1->getPositionX() : 0.f;
+        float winX0 = m_player1 ? px - 500.f  : -1e9f;
+        float winX1 = m_player1 ? px + 1600.f :  1e9f;
+
         for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
             if (!obj) continue;
+
+            auto pos = obj->getPosition();
+            if (pos.x < winX0 || pos.x > winX1) continue;
 
             int kind = -1;
             switch (obj->m_objectID) {
@@ -892,7 +921,6 @@ class $modify(BotPlayLayer, PlayLayer) {
             }
             if (kind < 0) continue;
 
-            auto pos = obj->getPosition();
             CCRect r;
 
             if (sim::isOrb(kind)) {
@@ -990,6 +1018,16 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->arcActive = false;
         f->stepInit = false;
         f->haveLast = false;
+
+        f->trajDirty = true;
+        f->trajCounter = 0;
+        f->trajPrevGround = true;
+        f->trajPrevFlip = false;
+        f->trajPrevVY = 0.f;
+        f->trajPrevWaveDir = 1;
+        f->trajPrevWasWave = false;
+        f->lastRebuildX = -1e9f;
+
         if (f->rebuilds < 2) {
             f->rebuilds++;
             f->needRebuild = true;
@@ -1001,12 +1039,19 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto f = m_fields.self();
         f->ticks++;
 
+        float px = m_player1 ? m_player1->getPositionX() : 0.f;
+        bool movedFar = std::abs(px - f->lastRebuildX) > 200.f;
+        bool timedOut = (f->ticks % 120 == 0);
+
         if ((!f->geometryBuilt && m_objects && m_objects->count() > 0) ||
-            f->ticks == 20 || f->needRebuild || (f->ticks % 30 == 0 && f->geometryBuilt)) {
+            f->ticks == 20 || f->needRebuild ||
+            (f->geometryBuilt && (movedFar || timedOut))) {
             f->geometryBuilt = true;
             f->needRebuild = false;
+            f->lastRebuildX = px;
             this->buildGeometry();
             f->lockIdx = -1;
+            f->trajDirty = true;
         }
 
         this->updateHud();
@@ -1337,56 +1382,103 @@ class $modify(BotPlayLayer, PlayLayer) {
         return s;
     }
 
+    // ---- trajectory dispatcher with cache ----
     void drawTrajectory() {
-        if (this->waveMode()) { this->drawWaveTrajectory(); return; }
-
         auto f = m_fields.self();
         if (!f->traj) return;
-        f->traj->clear();
-        if (!g.trajectory || !this->cubeMode()) return;
+        if (!g.trajectory) { f->traj->clear(); return; }
 
-        auto start = this->currentSimState();
+        bool isWave = this->waveMode();
+        bool isCube = this->cubeMode();
+        if (!isWave && !isCube) { f->traj->clear(); return; }
+
+        f->trajCounter++;
+
+        bool stateChanged = false;
+        if (isWave) {
+            if (!f->trajPrevWasWave) stateChanged = true;
+            f->trajPrevWasWave = true;
+
+            float vyHint = m_player1->m_yVelocity;
+            if (std::abs(vyHint) < 0.5f) vyHint = static_cast<float>(f->waveDir);
+            int dir = (vyHint >= 0.f) ? +1 : -1;
+            f->waveDir = dir;
+            if (dir != f->trajPrevWaveDir) { stateChanged = true; f->trajPrevWaveDir = dir; }
+        } else {
+            if (f->trajPrevWasWave) stateChanged = true;
+            f->trajPrevWasWave = false;
+
+            bool ground = m_player1->m_isOnGround;
+            bool flip = m_player1->m_isUpsideDown;
+            if (ground != f->trajPrevGround) stateChanged = true;
+            if (flip != f->trajPrevFlip) stateChanged = true;
+            if (std::abs(f->vy - f->trajPrevVY) > 3.f) stateChanged = true;
+            f->trajPrevGround = ground;
+            f->trajPrevFlip = flip;
+            f->trajPrevVY = f->vy;
+        }
+
+        if (!stateChanged && !f->trajDirty && f->trajCounter < 2) return;
+
+        f->trajCounter = 0;
+        f->trajDirty = false;
+        f->traj->clear();
+
+        if (isWave) {
+            this->drawWaveTrajectoryBody();
+        } else {
+            auto start = this->currentSimState();
+            this->drawCubeTrajectoryBody(start);
+        }
+    }
+
+    void drawCubeTrajectoryBody(sim::S const& start) {
+        auto f = m_fields.self();
         int H = sim::horizon(f->vx);
 
-        auto drawPath = [&](bool press, ccColor4F col) {
+        auto drawPath = [&](bool pressNow, int pressFrame, ccColor4F col) {
             auto s = start;
             auto prev = CCPoint{s.x, s.y};
             CCPoint end = prev;
             bool died = false;
 
             for (int i = 0; i < H; i++) {
-                sim::step(s, f->vx, press && i == 0);
+                bool fire = pressNow ? (i == 0) : (i == pressFrame);
+                sim::step(s, f->vx, fire);
                 CCPoint p{s.x, s.y};
-                if ((i & 1) == 0 || s.dead) {
+                if ((i % 2) == 0 || s.dead) {
                     f->traj->drawSegment(prev, p, 1.4f, col);
+                    prev = p;
                 }
-                prev = p;
                 end = p;
                 if (s.dead) { died = true; break; }
             }
-
-            ccColor4F markCol = died
-                ? ccc4f(1.f, 0.2f, 0.2f, 1.f)
-                : ccc4f(col.r, col.g, col.b, 0.85f);
-            f->traj->drawDot(end, 5.f, markCol);
+            f->traj->drawDot(end, 5.f,
+                died ? ccc4f(1.f, 0.2f, 0.2f, 1.f)
+                     : ccc4f(col.r, col.g, col.b, 0.85f));
         };
 
-        drawPath(false, ccc4f(1.f, 0.4f, 0.4f, 0.9f));
-        if (sim::canAct(start)) {
-            drawPath(true, ccc4f(0.3f, 1.f, 0.4f, 0.9f));
+        drawPath(false, -1, ccc4f(1.f, 0.4f, 0.4f, 0.9f));
+        if (sim::canAct(start)) drawPath(true, -1, ccc4f(0.3f, 1.f, 0.4f, 0.9f));
+
+        if (g.bot && f->havePlan) {
+            int planFrame = static_cast<int>(std::round((f->planX - start.x) / f->vx));
+            if (planFrame > 0 && planFrame < H) {
+                drawPath(false, planFrame, ccc4f(0.35f, 0.65f, 1.f, 0.9f));
+                f->traj->drawDot(CCPoint{start.x + f->vx * planFrame, start.y},
+                                 6.f, ccc4f(0.35f, 0.65f, 1.f, 1.f));
+            }
         }
     }
 
-    void drawWaveTrajectory() {
+    void drawWaveTrajectoryBody() {
         auto f = m_fields.self();
-        if (!f->traj) return;
-        f->traj->clear();
-        if (!g.trajectory) return;
+        int dir = f->waveDir;
 
         waveSim::S s;
         s.x = m_player1->getPositionX();
         s.y = m_player1->getPositionY();
-        s.dir = (f->vy >= 0.f) ? +1 : -1;
+        s.dir = dir;
         s.dead = false;
 
         int H = sim::horizon(f->vx);
@@ -1394,19 +1486,22 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto path = [&](bool clickNow, ccColor4F col) {
             waveSim::S w = s;
             auto prev = CCPoint{w.x, w.y};
-            waveSim::step(w, f->vx, clickNow);
-            for (int i = 0; i < H - 1; i++) {
+            CCPoint end = prev;
+            bool died = false;
+
+            for (int i = 0; i < H; i++) {
+                waveSim::step(w, f->vx, clickNow && i == 0);
                 CCPoint p{w.x, w.y};
-                if ((i & 1) == 0 || w.dead) {
+                if ((i % 2) == 0 || w.dead) {
                     f->traj->drawSegment(prev, p, 1.4f, col);
+                    prev = p;
                 }
-                prev = p;
-                if (w.dead) break;
-                waveSim::step(w, f->vx, false);
+                end = p;
+                if (w.dead) { died = true; break; }
             }
-            f->traj->drawDot(prev, 5.f,
-                w.dead ? ccc4f(1.f, 0.2f, 0.2f, 1.f)
-                       : ccc4f(col.r, col.g, col.b, 0.85f));
+            f->traj->drawDot(end, 5.f,
+                died ? ccc4f(1.f, 0.2f, 0.2f, 1.f)
+                     : ccc4f(col.r, col.g, col.b, 0.85f));
         };
 
         path(false, ccc4f(1.f, 0.4f, 0.4f, 0.9f));
@@ -1422,6 +1517,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->botHolding = true;
         f->botRelease = 2;
         f->cooldown = cooldown;
+        f->trajDirty = true;
         this->pressJump(true);
     }
 
@@ -1457,10 +1553,10 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         if (f->havePlan) {
             if (d < 0) {
-                if (++f->planIdle > 4) f->havePlan = false;
-            } else {
-                f->planIdle = 0;
+                if (++f->planIdle > 2) { f->havePlan = false; f->trajDirty = true; }
+                return;  // never press on a stale plan
             }
+            f->planIdle = 0;
 
             bool reachAim = act && s.x + p.vx * 0.5f >= f->planX;
             bool deadline = act && s.x + p.vx * 0.5f >= f->planDeadlineX;
@@ -1469,7 +1565,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                 return;
             }
 
-            if (s.x > f->planDeadlineX + p.vx * 4.f) f->havePlan = false;
+            if (s.x > f->planDeadlineX + p.vx * 4.f) { f->havePlan = false; f->trajDirty = true; }
             return;
         }
 
@@ -1480,12 +1576,13 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto scan = [&](int extra, int& first, int& last) {
             first = last = -1;
             int runFirst = -1;
+            int scanEnd = std::min(d, 30);
             auto w = s;
-            for (int k = 0; k <= d; k++) {
+            for (int k = 0; k <= scanEnd; k++) {
                 if (sim::canAct(w) && (extra == 0 || (k & 1) == 0)) {
                     auto j = w;
                     sim::step(j, p.vx, true);
-                    p.budget = extra == 0 ? 5000 : 8000;
+                    p.budget = extra == 0 ? 1500 : 2500;
                     bool ok = !j.dead && p.survive(j, 1, extra);
                     if (ok) {
                         if (runFirst < 0) runFirst = k;
@@ -1528,6 +1625,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->planX = aimX;
         f->planDeadlineX = lastX + p.vx * 0.5f;
         f->planIdle = 0;
+        f->trajDirty = true;
     }
 
     void tickWaveBot() {
@@ -1543,10 +1641,15 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (sim::boxes.empty() && sim::wide.empty()) return;
         if (f->botHolding || f->cooldown > 0) return;
 
+        float vyHint = m_player1->m_yVelocity;
+        if (std::abs(vyHint) < 0.5f) vyHint = static_cast<float>(f->waveDir);
+        int dir = (vyHint >= 0.f) ? +1 : -1;
+        f->waveDir = dir;
+
         waveSim::S s;
         s.x = m_player1->getPositionX();
         s.y = m_player1->getPositionY();
-        s.dir = (f->vy >= 0.f) ? +1 : -1;
+        s.dir = dir;
         s.dead = false;
 
         constexpr int H = 30;
