@@ -66,7 +66,7 @@ namespace sim {
 
     constexpr float HALF = 15.f;
     constexpr float HAZ_HALF = 14.f;
-    constexpr float ORB_HALF = 12.f;
+    constexpr float ORB_HALF = 15.f; // Match player hitbox for easier pad/orb activation
     constexpr float TERMINAL = -15.f;
     constexpr int SUB = 2;
 
@@ -305,7 +305,7 @@ namespace sim {
     }
 
     inline int horizon(float vx) {
-        return std::clamp(static_cast<int>(550.f / std::max(vx, 1.f)), 55, 120);
+        return std::clamp(static_cast<int>(700.f / std::max(vx, 1.f)), 70, 150);
     }
 
     inline int deathFrame(S s, float vx, int H) {
@@ -588,21 +588,21 @@ class $modify(BotPlayLayer, PlayLayer) {
         float ly = y * up;
         float floorL = flip ? -sim::ceilY : sim::floorY;
 
-        if (std::abs((ly - sim::HALF) - floorL) < 2.5f) return true;
+        if (std::abs((ly - sim::HALF) - floorL) < 3.f) return true;
 
         bool onBlock = false;
         sim::forEachNear(x, [&](sim::Box const& b) {
             if (b.kind != sim::Solid) return;
             float by1 = flip ? -b.y0 : b.y1;
-            if (x + sim::HALF > b.x0 && x - sim::HALF < b.x1 + 1.0f && 
-                std::abs((ly - sim::HALF) - by1) < 2.0f) onBlock = true;
+            if (x + sim::HALF > b.x0 && x - sim::HALF < b.x1 + 3.0f && 
+                std::abs((ly - sim::HALF) - by1) < 3.0f) onBlock = true;
         });
         
         bool onSlope = false;
         if (!onBlock) {
             sim::forEachNear(x, [&](sim::Box const& b) {
                 if (onSlope || b.kind != sim::Slope) return;
-                if (x < b.x0 || x > b.x1) return;
+                if (x < b.x0 - 2.f || x > b.x1 + 2.f) return;
                 float W = b.x1 - b.x0, Hh = b.y1 - b.y0;
                 if (W < 1.f || Hh < 1.f) return;
                 float t = (x - b.x0) / W;
@@ -610,7 +610,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                 bool top   = (b.corner & 2) != 0;
                 if (top) return;   
                 float surfY = right ? (b.y0 + Hh * t) : (b.y1 - Hh * t);
-                if (std::abs((ly - sim::HALF) - surfY) < 2.5f) onSlope = true;
+                if (std::abs((ly - sim::HALF) - surfY) < 4.0f) onSlope = true;
             });
         }
         return onBlock || onSlope;
@@ -1229,8 +1229,8 @@ class $modify(BotPlayLayer, PlayLayer) {
                     if (w.dead) break;
                 }
                 if (bestFirst >= 0) {
-                    // Aim for the absolute last possible frame to jump
-                    int jumpFrame = bestLast;
+                    // Aim for the middle of the safe window
+                    int jumpFrame = bestFirst + (bestLast - bestFirst) / 2;
                     aimX = s.x + vx * jumpFrame;
                     lastX = s.x + vx * bestLast;
                     return true;
