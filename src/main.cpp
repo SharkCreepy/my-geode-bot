@@ -101,7 +101,7 @@ namespace sim {
     inline int nSolid = 0, nHazard = 0, nPad = 0, nOrb = 0, nPortal = 0;
 
     constexpr float HALF = 15.f;
-    constexpr float HAZ_HALF = 10.f; 
+    constexpr float HAZ_HALF = 12.f; // Normal spike hitbox
     constexpr float ORB_HALF = 10.f; 
     constexpr float TERMINAL = -15.f;
     constexpr int SUB = 2;
@@ -869,8 +869,6 @@ class $modify(BotPlayLayer, PlayLayer) {
             auto pos = obj->getPosition();
             if (pos.x < winX0 || pos.x > winX1) continue;
 
-            // Ignore slopes entirely (the sim is flat-rectangle based)
-            // FIXED: Removed GameObjectType::Slope2 to fix compile error
             if (obj->m_objectType == GameObjectType::Slope) continue;
 
             int kind = -1;
@@ -896,9 +894,6 @@ class $modify(BotPlayLayer, PlayLayer) {
 
             if (sim::isOrb(kind)) {
                 r = CCRect(pos.x - 15.f, pos.y - 15.f, 30.f, 30.f);
-            } else if (kind == sim::Hazard) {
-                // PERFECT SPIKE HITBOX (15x15 triangle at the bottom)
-                r = CCRect(pos.x - 7.5f, pos.y - 15.f, 15.f, 15.f);
             } else {
                 r = obj->getObjectRect();
                 float mx = r.origin.x + r.size.width * 0.5f;
@@ -921,8 +916,8 @@ class $modify(BotPlayLayer, PlayLayer) {
             bool isDynamic = false;
             auto oit = oldPos.find(obj);
             if (oit != oldPos.end()) {
-                if (std::abs(oit->second.first  - r.origin.x) > 0.1f ||
-                    std::abs(oit->second.second - r.origin.y) > 0.1f) {
+                if (std::abs(oit->second.first  - r.origin.x) > 0.5f ||
+                    std::abs(oit->second.second - r.origin.y) > 0.5f) {
                     isDynamic = true;
                 }
             }
@@ -1212,7 +1207,11 @@ class $modify(BotPlayLayer, PlayLayer) {
         s.dead = false;
         s.lock = -1;
 
-        s.ground = this->isOnLocalGround(s.x, s.y, flip) || m_player1->m_isOnGround;
+        // Geometric ground check, overridden if moving upward
+        bool geomGround = this->isOnLocalGround(s.x, s.y, flip);
+        if (m_player1->m_yVelocity > 0.5f) geomGround = false; 
+        s.ground = geomGround || m_player1->m_isOnGround;
+
         s.vy = s.ground ? 0.f : f->vy * up;
 
         if (f->lockIdx >= 0) {
@@ -1365,6 +1364,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto f = m_fields.self();
         if (!s.ground) {
             f->lockIdx = sim::findOrb(s);
+        } else {
+            f->lockIdx = -1;
         }
         f->havePlan = false;
         f->botHolding = true;
@@ -1397,6 +1398,12 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (f->botHolding) return;
 
         auto s = this->currentSimState();
+        // ABSOLUTE HARD STOP: Never press in mid-air unless there is an orb
+        if (!s.ground && sim::findOrb(s) < 0) {
+            f->havePlan = false;
+            return; 
+        }
+
         sim::Planner p;
         p.vx = f->vx;
         p.H = sim::horizon(p.vx);
@@ -1429,13 +1436,13 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto scan = [&](int extra, int& first, int& last) {
             first = last = -1;
             int runFirst = -1;
-            int scanEnd = std::min(d, 30);
+            int scanEnd = d; // scan all the way to the death frame
             auto w = s;
             for (int k = 0; k <= scanEnd; k++) {
                 if (sim::canAct(w) && (extra == 0 || (k & 1) == 0)) {
                     auto j = w;
                     sim::step(j, p.vx, true);
-                    p.budget = extra == 0 ? 1500 : 2500;
+                    p.budget = extra == 0 ? 3000 : 5000;
                     bool ok = !j.dead && p.survive(j, 1, extra);
                     if (ok) {
                         if (runFirst < 0) runFirst = k;
@@ -1462,7 +1469,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         float firstX = s.x + p.vx * first;
         float lastX  = s.x + p.vx * last;
-        float aimX = lastX - p.vx * 1.5f; // Aim slightly before the last possible frame to avoid clipping
+        float aimX = lastX - p.vx * 1.0f;
         if (aimX < firstX) aimX = firstX;
 
         if (first == 0 && last <= 1) {
