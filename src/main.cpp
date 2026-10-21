@@ -102,9 +102,9 @@ namespace sim {
     inline float floorY = 90.f;
 
     constexpr float HALF = 15.f;       // cube half size (solid collisions)
-    constexpr float HAZ_HALF = 10.f;   // cube hazard hitbox half size
-    constexpr float JUMP_VEL = 11.180032f;
-    constexpr float GRAV = 0.958199f;
+    constexpr float HAZ_HALF = 11.5f;  // cube hazard hitbox half size (slightly conservative)
+    inline float jumpVel = 11.180032f; // auto-calibrated from your real jumps
+    inline float grav = 0.958199f;
     constexpr float TERMINAL = -15.f;
     constexpr int SUB = 2;             // substeps per 60fps frame
 
@@ -124,14 +124,14 @@ namespace sim {
     // advance one 60fps frame. vx = horizontal units per 60fps frame
     inline void step(S& s, float vx, bool jump) {
         if (s.dead) return;
-        if (jump && s.ground) { s.vy = JUMP_VEL; s.ground = false; }
+        if (jump && s.ground) { s.vy = jumpVel; s.ground = false; }
 
         constexpr float dt = 1.f / SUB;
         for (int i = 0; i < SUB && !s.dead; i++) {
             // ---- vertical ----
             float prevBottom = s.y - HALF;
             float prevTop = s.y + HALF;
-            s.vy = std::max(s.vy - GRAV * dt, TERMINAL);
+            s.vy = std::max(s.vy - grav * dt, TERMINAL);
             s.y += s.vy * dt;
             s.ground = false;
 
@@ -173,9 +173,41 @@ namespace sim {
         }
     }
 
+    inline int horizon(float vx) {
+        return std::clamp(static_cast<int>(450.f / std::max(vx, 1.f)), 40, 110);
+    }
+
+    // jump arc on flat ground with the given constants -> apex height + airtime (60fps frames)
+    inline void flatJump(float v0, float g, float& H, float& T) {
+        float y = 0.f, vy = v0;
+        H = 0.f; T = 200.f;
+        constexpr float dt = 1.f / SUB;
+        for (int i = 0; i < SUB * 200; i++) {
+            vy = std::max(vy - g * dt, TERMINAL);
+            y += vy * dt;
+            H = std::max(H, y);
+            if (y <= 0.f && vy < 0.f) { T = (i + 1) * dt; return; }
+        }
+    }
+
+    // Feed in a MEASURED flat jump (apex height in units, airtime in frames).
+    // Nudges jumpVel/grav so the simulator matches the real game.
+    inline bool calibrate(float Hm, float Tm) {
+        float Hs, Ts;
+        flatJump(jumpVel, grav, Hs, Ts);
+        if (Hs <= 0.f || Ts <= 0.f || Hm <= 0.f || Tm <= 0.f) return false;
+        float rH = Hm / Hs, rT = Tm / Ts;
+        if (rH < 0.75f || rH > 1.3f || rT < 0.75f || rT > 1.3f) return false;
+        float nv = jumpVel * rH / rT;
+        float ng = grav * rH / (rT * rT);
+        jumpVel = std::clamp(jumpVel + (nv - jumpVel) * 0.5f, 7.f, 16.f);
+        grav = std::clamp(grav + (ng - grav) * 0.5f, 0.5f, 1.5f);
+        return true;
+    }
+
     // Lookahead search: does ANY sequence of <= jumpsLeft jumps survive until frame H?
     struct Planner {
-        static constexpr int H = 70;     // lookahead frames (~1.2s)
+        int H = 70;                      // lookahead frames
         float vx = 5.19f;
         int budget = 0;
 
@@ -194,6 +226,11 @@ namespace sim {
             return true;
         }
     };
+}
+
+$on_mod(Loaded) {
+    sim::jumpVel = std::clamp(Mod::get()->getSavedValue<float>("jumpVel", sim::jumpVel), 7.f, 16.f);
+    sim::grav = std::clamp(Mod::get()->getSavedValue<float>("grav", sim::grav), 0.5f, 1.5f);
 }
 
 // ===============================================================
@@ -504,12 +541,20 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool holding = false;
 
         // noclip stats
-        bool hitThisFrame = false;
-        bool hitLastFrame = false;
-        int hits = 0;
-        int totalFrames = 0;
-        int deadFrames = 0;
+        // (counted per physics step when the step hook works, per frame otherwise)
+        bool hitFlag = false;
+        bool stepHookSeen = false;
+        int stepsSinceHit = 1000;
+        int deaths = 0;
+        long totalSteps = 0;
+        long deadSteps = 0;
         int labelTick = 0;
+
+        // jump-arc measurement for auto-calibration
+        bool arcActive = false;
+        bool arcWasGround = true;
+        float arcStartX = 0.f, arcStartY = 0.f, arcApex = 0.f;
+        float arcPrevX = 0.f, arcPrevY = 0.f;
 
         // HUD
         DraggableNode* hud = nullptr;
@@ -525,7 +570,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         // trajectory + bot
         CCDrawNode* traj = nullptr;
         int botRelease = 0;
-        int windowWidth = 0;
+        bool havePlan = false;
+        float planX = 0.f;
         bool botHolding = false;
         bool geometryBuilt = false;
         CCLabelBMFont* status = nullptr;
@@ -565,7 +611,7 @@ class $modify(BotPlayLayer, PlayLayer) {
             hbg->setPosition({85.f, 13.f});
             hud->addChild(hbg);
 
-            auto label = CCLabelBMFont::create("Hits: 0   Acc: 100.0%", "bigFont.fnt");
+            auto label = CCLabelBMFont::create("Deaths: 0   Acc: 100.0%", "bigFont.fnt");
             label->setScale(0.38f);
             label->setPosition({85.f, 13.f});
             hud->addChild(label);
@@ -641,7 +687,7 @@ class $modify(BotPlayLayer, PlayLayer) {
     // ---------- noclip ----------
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         if (g.noclip) {
-            m_fields->hitThisFrame = true;
+            m_fields->hitFlag = true;
             return;
         }
         PlayLayer::destroyPlayer(player, object);
@@ -656,12 +702,13 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->holding = false;
         f->botHolding = false;
         f->botRelease = 0;
-        f->windowWidth = 0;
-        f->hits = 0;
-        f->totalFrames = 0;
-        f->deadFrames = 0;
-        f->hitThisFrame = false;
-        f->hitLastFrame = false;
+        f->havePlan = false;
+        f->deaths = 0;
+        f->totalSteps = 0;
+        f->deadSteps = 0;
+        f->stepsSinceHit = 1000;
+        f->hitFlag = false;
+        f->arcActive = false;
         f->haveLast = false;
         this->applyLayoutMode(g.layout);
     }
@@ -710,7 +757,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (!m_player1) msg = "no player";
         else if (!this->cubeMode()) msg = "Not in cube mode (bot + trajectory are cube only)";
         else if (sim::boxes.empty()) msg = "No level geometry found";
-        else msg = fmt::format("{} objects | {}", sim::boxes.size(), g.bot ? "bot active" : "trajectory on");
+        else msg = fmt::format("{} objects | {} | jump {:.2f}/{:.3f}", sim::boxes.size(),
+                               g.bot ? "bot active" : "trajectory on", sim::jumpVel, sim::grav);
         f->status->setString(msg.c_str());
     }
 
@@ -735,28 +783,99 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (f->hudBg) f->hudBg->setColor(g.hudEdit ? ccColor3B{255, 220, 60} : ccColor3B{255, 255, 255});
     }
 
+    // One call per physics step (or per frame as a fallback).
+    // A "death" = one continuous contact with a spike/block. Accuracy = share of
+    // steps NOT spent inside something deadly.
+    void registerStep(bool fromStepHook) {
+        auto f = m_fields.self();
+        bool hit = f->hitFlag;
+        f->hitFlag = false;
+
+        if (!g.noclip) {
+            f->stepsSinceHit = 1000;
+            return;
+        }
+
+        int gap = fromStepHook ? 6 : 2; // tiny gaps inside one contact don't count as a new death
+        f->totalSteps++;
+        if (hit) {
+            if (f->stepsSinceHit <= gap) {
+                f->deadSteps += f->stepsSinceHit;
+            } else {
+                f->deaths++;
+            }
+            f->deadSteps++;
+            f->stepsSinceHit = 0;
+        } else if (f->stepsSinceHit < 1000) {
+            f->stepsSinceHit++;
+        }
+    }
+
+    // called from the PlayerObject::update hook (once per physics step)
+    void onPhysicsStep() {
+        auto f = m_fields.self();
+        f->stepHookSeen = true;
+        this->registerStep(true);
+        this->sampleArc();
+    }
+
+    // Measures real jumps (flat ground -> same height) to calibrate the simulator
+    void sampleArc() {
+        auto f = m_fields.self();
+        if (!m_player1) return;
+        float x = m_player1->getPositionX();
+        float y = m_player1->getPositionY();
+        bool ground = m_player1->m_isOnGround;
+
+        if (!this->cubeMode()) {
+            f->arcActive = false;
+        } else if (!f->arcActive) {
+            if (f->arcWasGround && !ground && y > f->arcPrevY + 0.01f) {
+                f->arcActive = true;
+                f->arcStartX = f->arcPrevX;
+                f->arcStartY = f->arcPrevY;
+                f->arcApex = y - f->arcStartY;
+            }
+        } else {
+            f->arcApex = std::max(f->arcApex, y - f->arcStartY);
+            float dx = x - f->arcStartX;
+            if (dx < 0.f || dx > f->vx * 70.f) {
+                f->arcActive = false;               // teleport / too long: ignore
+            } else if (ground) {
+                f->arcActive = false;
+                float dy = y - f->arcStartY;
+                if (std::abs(dy) < 0.5f && f->vx > 1.f) {
+                    float airFrames = dx / f->vx;
+                    if (sim::calibrate(f->arcApex, airFrames)) {
+                        Mod::get()->setSavedValue<float>("jumpVel", sim::jumpVel);
+                        Mod::get()->setSavedValue<float>("grav", sim::grav);
+                    }
+                }
+            }
+        }
+
+        f->arcWasGround = ground;
+        f->arcPrevX = x;
+        f->arcPrevY = y;
+    }
+
     void tickNoclipStats() {
         auto f = m_fields.self();
 
-        if (g.noclip) {
-            f->totalFrames++;
-            if (f->hitThisFrame) {
-                f->deadFrames++;
-                if (!f->hitLastFrame) f->hits++;
-            }
+        if (!f->stepHookSeen) {      // fallback if the physics-step hook isn't firing
+            this->registerStep(false);
+            this->sampleArc();
         }
-        f->hitLastFrame = f->hitThisFrame;
-        f->hitThisFrame = false;
 
         if (f->hudLabel && ++f->labelTick >= 6) {
             f->labelTick = 0;
-            float acc = f->totalFrames > 0
-                ? 100.f * (1.f - static_cast<float>(f->deadFrames) / f->totalFrames)
+            float acc = f->totalSteps > 0
+                ? 100.f * (1.f - static_cast<float>(f->deadSteps) / static_cast<float>(f->totalSteps))
                 : 100.f;
-            f->hudLabel->setString(fmt::format("Hits: {}   Acc: {:.1f}%", f->hits, acc).c_str());
+            f->hudLabel->setString(fmt::format("Deaths: {}   Acc: {:.1f}%", f->deaths, acc).c_str());
             float w = f->hudLabel->getContentSize().width;
-            float s = std::min(0.38f, 160.f / std::max(w, 1.f));
-            f->hudLabel->setScale(s);
+            float sc = std::min(0.38f, 160.f / std::max(w, 1.f));
+            f->hudLabel->setScale(sc);
         }
     }
 
@@ -828,7 +947,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                 if (!b.hazard && std::abs(b.y1 - bottom) < 1.5f &&
                     s.x + sim::HALF > b.x0 && s.x - sim::HALF < b.x1) onBlock = true;
             });
-            if (!onBlock) sim::floorY = bottom;
+            if (!onBlock && bottom > 84.f && bottom < 96.f) sim::floorY = bottom;
         }
         return s;
     }
@@ -845,7 +964,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto drawPath = [&](bool firstJump, ccColor4F col) {
             auto s = start;
             auto prev = CCPoint{s.x, s.y};
-            for (int i = 0; i < sim::Planner::H; i++) {
+            int H = sim::horizon(f->vx);
+            for (int i = 0; i < H; i++) {
                 sim::step(s, f->vx, firstJump && i == 0);
                 CCPoint p{s.x, s.y};
                 f->traj->drawSegment(prev, p, 1.2f, col);
@@ -881,19 +1001,23 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         sim::Planner p;
         p.vx = f->vx;
+        p.H = sim::horizon(p.vx);
+
+        // forget a stale plan (we've already driven past it)
+        if (f->havePlan && f->planX < s.x - 2.f * p.vx) f->havePlan = false;
 
         // 1) Can we just keep going without jumping?
-        p.budget = 20000;
+        p.budget = 30000;
         if (p.survive(s, 0, 0)) {
-            f->windowWidth = 0;
+            f->havePlan = false;
             return;
         }
 
         // 2) Find the contiguous window of "jump now"-frames that survive
         int first = -1, last = -1;
         auto w = s;
-        p.budget = 40000;
-        for (int k = 0; k < 45; k++) {
+        p.budget = 80000;
+        for (int k = 0; k < 50; k++) {
             auto j = w;
             sim::step(j, p.vx, true);
             bool ok = !j.dead && p.survive(j, 1, 1);
@@ -907,19 +1031,26 @@ class $modify(BotPlayLayer, PlayLayer) {
             if (w.dead || !w.ground) break;
         }
 
+        // 3) Aim for the CENTER of the window (measured in x, so speed changes don't matter)
         bool doJump = false;
         if (first < 0) {
             doJump = true; // no safe window found: try anyway
-        } else if (first > 0) {
-            f->windowWidth = last - first + 1; // window is still ahead; remember its size
         } else {
-            int remaining = last + 1;
-            int target = f->windowWidth > 0 ? (f->windowWidth + 1) / 2 : 5;
-            if (remaining <= target) doJump = true;
+            float centerX = s.x + p.vx * (first + last) * 0.5f;
+            if (first > 0) {
+                f->havePlan = true;       // window still ahead: keep refining the target
+                f->planX = centerX;
+            } else {
+                if (!f->havePlan) {       // window already open and we never saw it coming
+                    f->havePlan = true;
+                    f->planX = centerX;
+                }
+                if (s.x + p.vx * 0.5f >= f->planX || last <= 1) doJump = true;
+            }
         }
 
         if (doJump) {
-            f->windowWidth = 0;
+            f->havePlan = false;
             f->botHolding = true;
             f->botRelease = 2;
             this->pressJump(true);
@@ -950,5 +1081,21 @@ class $modify(BotPlayLayer, PlayLayer) {
             m_groundLayer->updateGround01Color({25, 40, 170});
             m_groundLayer->updateGround02Color({25, 40, 170});
         }
+    }
+};
+
+
+// ===============================================================
+// Per-physics-step hook (240 steps/s on most setups). Used for exact
+// noclip stats and to measure real jumps for auto-calibration.
+// ===============================================================
+class $modify(StepPlayer, PlayerObject) {
+    void update(float dt) {
+        if (auto pl = PlayLayer::get()) {
+            if (pl->m_player1 == this) {
+                static_cast<BotPlayLayer*>(pl)->onPhysicsStep();
+            }
+        }
+        PlayerObject::update(dt);
     }
 };
