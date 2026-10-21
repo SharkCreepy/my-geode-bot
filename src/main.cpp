@@ -90,41 +90,97 @@ class $modify(SpeedScheduler, CCScheduler) {
 // ===============================================================
 // Simplified cube physics simulator (used by trajectory + bot)
 //
-// Only models: cube, flat ground, solid blocks, hazards.
-// Does NOT model: orbs, pads, portals, ship/ball/ufo/wave/etc,
-// slopes, moving objects, gravity flips, mini size.
+// Models: cube, flat ground, solid blocks, hazards (spikes/saws),
+//         yellow/pink/red jump pads and yellow/pink/red jump orbs.
+// Does NOT model: gravity/dash/black/green/blue orbs, portals,
+//         other game modes, slopes, moving objects, mini size.
 // ===============================================================
 namespace sim {
-    struct Box { float x0, y0, x1, y1; bool hazard; };
+    enum Kind : int {
+        Solid = 0, Hazard,
+        PadYellow, PadPink, PadRed,
+        OrbYellow, OrbPink, OrbRed
+    };
 
-    inline std::vector<Box> boxes;
+    struct Box { float x0, y0, x1, y1; int kind; };
+
+    inline std::vector<Box> boxes;   // normal-size objects, sorted by x0
+    inline std::vector<Box> wide;    // very wide solids/hazards (always checked)
     inline float maxW = 30.f;
     inline float floorY = 90.f;
+    inline int nSolid = 0, nHazard = 0, nPad = 0, nOrb = 0;
 
     constexpr float HALF = 15.f;       // cube half size (solid collisions)
     constexpr float HAZ_HALF = 11.5f;  // cube hazard hitbox half size (slightly conservative)
-    inline float jumpVel = 11.180032f; // auto-calibrated from your real jumps
-    inline float grav = 0.958199f;
+    constexpr float ORB_HALF = 12.f;   // how close the cube must be to touch an orb/pad
     constexpr float TERMINAL = -15.f;
     constexpr int SUB = 2;             // substeps per 60fps frame
 
-    struct S { float x, y, vy; bool ground; bool dead; };
+    inline float jumpVel = 11.180032f; // auto-calibrated from your real jumps
+    inline float grav = 0.958199f;
+    // launch strength relative to a normal jump (pads are auto-calibrated)
+    inline float padMul[3] = {1.43f, 0.93f, 1.79f};   // yellow, pink, red
+    inline float orbMul[3] = {1.00f, 0.68f, 1.30f};   // yellow, pink, red
+
+    struct S {
+        float x = 0.f, y = 0.f, vy = 0.f;
+        bool ground = false;
+        bool dead = false;
+        int lock = -1;   // pad/orb currently being touched that already fired
+    };
+
+    inline bool isPad(int k) { return k >= PadYellow && k <= PadRed; }
+    inline bool isOrb(int k) { return k >= OrbYellow && k <= OrbRed; }
 
     inline bool overlap(float x, float y, float h, Box const& b) {
         return x + h > b.x0 && x - h < b.x1 && y + h > b.y0 && y - h < b.y1;
     }
 
+    inline std::vector<Box>::iterator firstNear(float x) {
+        return std::lower_bound(boxes.begin(), boxes.end(), x - HALF - maxW - 20.f,
+            [](Box const& b, float v) { return b.x0 < v; });
+    }
+
     template <class F>
     inline void forEachNear(float x, F&& fn) {
-        auto it = std::lower_bound(boxes.begin(), boxes.end(), x - HALF - maxW,
-            [](Box const& b, float v) { return b.x0 < v; });
-        for (; it != boxes.end() && it->x0 <= x + HALF; ++it) fn(*it);
+        for (auto it = firstNear(x); it != boxes.end() && it->x0 <= x + HALF + 20.f; ++it) fn(*it);
+        for (auto const& b : wide) fn(b);
+    }
+
+    inline int indexOf(Box const& b) { return static_cast<int>(&b - boxes.data()); }
+
+    // index of an unused orb the cube is touching, or -1
+    inline int findOrb(S const& s) {
+        for (auto it = firstNear(s.x); it != boxes.end() && it->x0 <= s.x + HALF + 20.f; ++it) {
+            if (!isOrb(it->kind)) continue;
+            int idx = static_cast<int>(it - boxes.begin());
+            if (idx == s.lock) continue;
+            if (overlap(s.x, s.y, ORB_HALF, *it)) return idx;
+        }
+        return -1;
+    }
+
+    // can a button press DO something right now? (jump from ground, or hit an orb)
+    inline bool canAct(S const& s) {
+        return !s.dead && (s.ground || findOrb(s) >= 0);
     }
 
     // advance one 60fps frame. vx = horizontal units per 60fps frame
-    inline void step(S& s, float vx, bool jump) {
+    inline void step(S& s, float vx, bool press) {
         if (s.dead) return;
-        if (jump && s.ground) { s.vy = jumpVel; s.ground = false; }
+
+        if (press) {
+            if (s.ground) {
+                s.vy = jumpVel;
+                s.ground = false;
+            } else {
+                int o = findOrb(s);
+                if (o >= 0) {
+                    s.vy = jumpVel * orbMul[boxes[o].kind - OrbYellow];
+                    s.lock = o;
+                }
+            }
+        }
 
         constexpr float dt = 1.f / SUB;
         for (int i = 0; i < SUB && !s.dead; i++) {
@@ -142,7 +198,7 @@ namespace sim {
             }
 
             forEachNear(s.x, [&](Box const& b) {
-                if (b.hazard || s.dead) return;
+                if (b.kind != Solid || s.dead) return;
                 if (!overlap(s.x, s.y, HALF, b)) return;
                 if (s.vy <= 0.f && prevBottom >= b.y1 - 1.f) {
                     s.y = b.y1 + HALF;
@@ -158,18 +214,33 @@ namespace sim {
             s.x += vx * dt;
             forEachNear(s.x, [&](Box const& b) {
                 if (s.dead) return;
-                if (b.hazard) {
+                if (b.kind == Hazard) {
                     if (overlap(s.x, s.y, HAZ_HALF, b)) s.dead = true;
-                    return;
-                }
-                if (overlap(s.x, s.y, HALF, b)) {
-                    if (s.y - HALF >= b.y1 - 2.f) {
-                        s.y = b.y1 + HALF; s.vy = 0.f; s.ground = true;
-                    } else {
-                        s.dead = true; // hit the side of a block
+                } else if (b.kind == Solid) {
+                    if (overlap(s.x, s.y, HALF, b)) {
+                        if (s.y - HALF >= b.y1 - 2.f) {
+                            s.y = b.y1 + HALF; s.vy = 0.f; s.ground = true;
+                        } else {
+                            s.dead = true; // hit the side of a block
+                        }
+                    }
+                } else if (isPad(b.kind)) {
+                    int idx = indexOf(b);
+                    if (idx != s.lock && overlap(s.x, s.y, ORB_HALF, b)) {
+                        s.vy = jumpVel * padMul[b.kind - PadYellow];
+                        s.ground = false;
+                        s.lock = idx;
                     }
                 }
             });
+
+            // release the lock once we've left the pad/orb
+            if (s.lock >= 0) {
+                if (s.lock >= static_cast<int>(boxes.size()) ||
+                    !overlap(s.x, s.y, ORB_HALF + 4.f, boxes[s.lock])) {
+                    s.lock = -1;
+                }
+            }
         }
     }
 
@@ -191,7 +262,6 @@ namespace sim {
     }
 
     // Feed in a MEASURED flat jump (apex height in units, airtime in frames).
-    // Nudges jumpVel/grav so the simulator matches the real game.
     inline bool calibrate(float Hm, float Tm) {
         float Hs, Ts;
         flatJump(jumpVel, grav, Hs, Ts);
@@ -205,32 +275,66 @@ namespace sim {
         return true;
     }
 
-    // Lookahead search: does ANY sequence of <= jumpsLeft jumps survive until frame H?
+    // A measured pad launch (flat ground -> same height): learn that pad's strength.
+    inline bool calibratePad(int padIdx, float Hm) {
+        if (Hm < 20.f || padIdx < 0 || padIdx > 2) return false;
+        float lo = 3.f, hi = 40.f;
+        for (int i = 0; i < 24; i++) {
+            float mid = (lo + hi) * 0.5f, H, T;
+            flatJump(mid, grav, H, T);
+            if (H < Hm) lo = mid; else hi = mid;
+        }
+        float m = ((lo + hi) * 0.5f) / jumpVel;
+        if (m < 0.4f || m > 3.f) return false;
+        padMul[padIdx] += (m - padMul[padIdx]) * 0.5f;
+        return true;
+    }
+
+    // Lookahead search: can some sequence of <= pressesLeft presses survive until frame H?
+    // Only branches when coasting would actually die, and only before that death.
     struct Planner {
-        int H = 70;                      // lookahead frames
+        int H = 70;
         float vx = 5.19f;
         int budget = 0;
 
-        bool survive(S s, int frame, int jumpsLeft) {
-            while (frame < H) {
+        struct Cand { int f; S s; };
+
+        bool survive(S s, int frame, int pressesLeft) {
+            Cand cands[64];
+            int nc = 0;
+            S t = s;
+            int f = frame;
+            bool died = false;
+
+            while (f < H) {
                 if (--budget <= 0) return true; // out of budget: assume ok
-                if (s.ground && jumpsLeft > 0 && (frame & 1) == 0) {
-                    S j = s;
-                    step(j, vx, true);
-                    if (!j.dead && survive(j, frame + 1, jumpsLeft - 1)) return true;
+                if (pressesLeft > 0 && (f & 1) == 0 && nc < 64 && canAct(t)) {
+                    cands[nc++] = {f, t};
                 }
-                step(s, vx, false);
-                if (s.dead) return false;
-                frame++;
+                step(t, vx, false);
+                if (t.dead) { died = true; break; }
+                f++;
             }
-            return true;
+            if (!died) return true;
+
+            for (int i = nc - 1; i >= 0; i--) {       // latest presses first
+                S j = cands[i].s;
+                step(j, vx, true);
+                if (!j.dead && survive(j, cands[i].f + 1, pressesLeft - 1)) return true;
+            }
+            return false;
         }
     };
 }
 
 $on_mod(Loaded) {
-    sim::jumpVel = std::clamp(Mod::get()->getSavedValue<float>("jumpVel", sim::jumpVel), 7.f, 16.f);
-    sim::grav = std::clamp(Mod::get()->getSavedValue<float>("grav", sim::grav), 0.5f, 1.5f);
+    auto m = Mod::get();
+    sim::jumpVel = std::clamp(m->getSavedValue<float>("jumpVel", sim::jumpVel), 7.f, 16.f);
+    sim::grav = std::clamp(m->getSavedValue<float>("grav", sim::grav), 0.5f, 1.5f);
+    for (int i = 0; i < 3; i++) {
+        sim::padMul[i] = std::clamp(
+            m->getSavedValue<float>(fmt::format("padMul{}", i), sim::padMul[i]), 0.4f, 3.f);
+    }
 }
 
 // ===============================================================
@@ -516,7 +620,7 @@ public:
         if (ret->init()) {
             ret->m_fn = std::move(fn);
             ret->autorelease();
-            ret->scheduleUpdate();
+            ret->scheduleUpdateWithPriority(100);
             return ret;
         }
         delete ret;
@@ -534,14 +638,17 @@ public:
 class $modify(BotPlayLayer, PlayLayer) {
     struct Fields {
         bool prevLayout = false;
+        int ticks = 0;
+        int rebuilds = 0;
+        bool needRebuild = false;
+        bool geometryBuilt = false;
 
         // autoclicker
         float clickTimer = 0.f;
         float holdTimer = 0.f;
         bool holding = false;
 
-        // noclip stats
-        // (counted per physics step when the step hook works, per frame otherwise)
+        // noclip stats (counted per physics step when the step hook works)
         bool hitFlag = false;
         bool stepHookSeen = false;
         int stepsSinceHit = 1000;
@@ -549,12 +656,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         long totalSteps = 0;
         long deadSteps = 0;
         int labelTick = 0;
-
-        // jump-arc measurement for auto-calibration
-        bool arcActive = false;
-        bool arcWasGround = true;
-        float arcStartX = 0.f, arcStartY = 0.f, arcApex = 0.f;
-        float arcPrevX = 0.f, arcPrevY = 0.f;
 
         // HUD
         DraggableNode* hud = nullptr;
@@ -566,15 +667,27 @@ class $modify(BotPlayLayer, PlayLayer) {
         float lastX = 0.f, lastY = 0.f;
         float vx = 5.193f;   // 311.58 u/s at 1x speed
         float vy = 0.f;
+        int stepsThisTick = 0;
+        float tpsEma = 240.f;
+
+        // jump-arc measurement for auto-calibration
+        bool arcActive = false;
+        bool arcWasGround = true;
+        float arcStartX = 0.f, arcStartY = 0.f, arcApex = 0.f;
+        float arcPrevX = 0.f, arcPrevY = 0.f;
+        int arcPad = -1;
 
         // trajectory + bot
         CCDrawNode* traj = nullptr;
         int botRelease = 0;
+        bool botHolding = false;
         bool havePlan = false;
         float planX = 0.f;
-        bool botHolding = false;
-        bool geometryBuilt = false;
+        int cooldown = 0;
+        int retry = 0;
+        int lockIdx = -1;
         CCLabelBMFont* status = nullptr;
+        std::string lastStatus;
     };
 
     // ---------- setup ----------
@@ -633,7 +746,7 @@ class $modify(BotPlayLayer, PlayLayer) {
             m_fields->traj = node;
         }
 
-        // ---- small status line (tells you why bot/trajectory might be idle) ----
+        // ---- small status line ----
         auto status = CCLabelBMFont::create("", "bigFont.fnt");
         status->setScale(0.35f);
         status->setOpacity(200);
@@ -650,27 +763,73 @@ class $modify(BotPlayLayer, PlayLayer) {
         return true;
     }
 
+    // ---------- level geometry ----------
     void buildGeometry() {
         sim::boxes.clear();
+        sim::wide.clear();
         sim::maxW = 30.f;
         sim::floorY = 90.f;
+        sim::nSolid = sim::nHazard = sim::nPad = sim::nOrb = 0;
         if (!m_objects) return;
 
         for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
             if (!obj) continue;
-            bool hazard = obj->m_objectType == GameObjectType::Hazard;
-            bool solid = obj->m_objectType == GameObjectType::Solid;
-            if (!hazard && !solid) continue;
 
-            auto r = obj->getObjectRect();
+            int kind = -1;
+            switch (obj->m_objectID) {
+                case 35:   kind = sim::PadYellow; break;
+                case 140:  kind = sim::PadPink;   break;
+                case 1332: kind = sim::PadRed;    break;
+                case 36:   kind = sim::OrbYellow; break;
+                case 141:  kind = sim::OrbPink;   break;
+                case 1333: kind = sim::OrbRed;    break;
+                default:
+                    if (obj->m_objectType == GameObjectType::Hazard) kind = sim::Hazard;
+                    else if (obj->m_objectType == GameObjectType::Solid) kind = sim::Solid;
+            }
+            if (kind < 0) continue;
+
+            auto pos = obj->getPosition();
+            CCRect r;
+
+            if (sim::isOrb(kind)) {
+                r = CCRect(pos.x - 18.f, pos.y - 18.f, 36.f, 36.f);
+            } else {
+                r = obj->getObjectRect();
+                float mx = r.origin.x + r.size.width * 0.5f;
+                float my = r.origin.y + r.size.height * 0.5f;
+                bool valid = r.size.width >= 1.f && r.size.height >= 1.f &&
+                             std::abs(mx - pos.x) < 80.f && std::abs(my - pos.y) < 80.f;
+                if (!valid) {
+                    // hitbox not ready / bogus: fall back to the sprite's bounding box
+                    auto bb = obj->boundingBox();
+                    if (kind == sim::Hazard) {
+                        float cx = bb.origin.x + bb.size.width * 0.5f;
+                        float cy = bb.origin.y + bb.size.height * 0.5f;
+                        float w = bb.size.width * 0.55f, h = bb.size.height * 0.55f;
+                        r = CCRect(cx - w * 0.5f, cy - h * 0.5f, w, h);
+                    } else if (sim::isPad(kind)) {
+                        r = CCRect(pos.x - 15.f, pos.y - 15.f, 30.f, 12.f);
+                    } else {
+                        r = bb;
+                    }
+                }
+            }
             if (r.size.width <= 0.f || r.size.height <= 0.f) continue;
 
-            sim::boxes.push_back({
-                r.origin.x, r.origin.y,
-                r.origin.x + r.size.width, r.origin.y + r.size.height,
-                hazard
-            });
-            sim::maxW = std::max(sim::maxW, r.size.width);
+            sim::Box b{r.origin.x, r.origin.y, r.origin.x + r.size.width, r.origin.y + r.size.height, kind};
+            bool isWide = r.size.width > 120.f && (kind == sim::Solid || kind == sim::Hazard);
+            if (isWide) {
+                sim::wide.push_back(b);
+            } else {
+                sim::boxes.push_back(b);
+                sim::maxW = std::max(sim::maxW, r.size.width);
+            }
+
+            if (kind == sim::Solid) sim::nSolid++;
+            else if (kind == sim::Hazard) sim::nHazard++;
+            else if (sim::isPad(kind)) sim::nPad++;
+            else sim::nOrb++;
         }
         std::sort(sim::boxes.begin(), sim::boxes.end(),
                   [](sim::Box const& a, sim::Box const& b) { return a.x0 < b.x0; });
@@ -703,6 +862,9 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->botHolding = false;
         f->botRelease = 0;
         f->havePlan = false;
+        f->cooldown = 0;
+        f->retry = 0;
+        f->lockIdx = -1;
         f->deaths = 0;
         f->totalSteps = 0;
         f->deadSteps = 0;
@@ -710,16 +872,22 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->hitFlag = false;
         f->arcActive = false;
         f->haveLast = false;
+        if (f->rebuilds < 2) {          // hitboxes may only be ready after the level has run a bit
+            f->rebuilds++;
+            f->needRebuild = true;
+        }
         this->applyLayoutMode(g.layout);
     }
 
-    // ---------- per-frame ----------
+    // ---------- per-frame (driven by the Ticker, runs after the game's own update) ----------
     void tickAll(float dt) {
         auto f = m_fields.self();
+        f->ticks++;
 
-        // build level geometry once the objects exist
-        if (!f->geometryBuilt && m_objects && m_objects->count() > 0) {
+        if ((!f->geometryBuilt && m_objects && m_objects->count() > 0) ||
+            f->ticks == 20 || f->needRebuild) {
             f->geometryBuilt = true;
+            f->needRebuild = false;
             this->buildGeometry();
         }
 
@@ -756,10 +924,15 @@ class $modify(BotPlayLayer, PlayLayer) {
         std::string msg;
         if (!m_player1) msg = "no player";
         else if (!this->cubeMode()) msg = "Not in cube mode (bot + trajectory are cube only)";
-        else if (sim::boxes.empty()) msg = "No level geometry found";
-        else msg = fmt::format("{} objects | {} | jump {:.2f}/{:.3f}", sim::boxes.size(),
-                               g.bot ? "bot active" : "trajectory on", sim::jumpVel, sim::grav);
-        f->status->setString(msg.c_str());
+        else if (sim::boxes.empty() && sim::wide.empty()) msg = "No level geometry found";
+        else msg = fmt::format("S{} H{} P{} O{} | jump {:.2f}/{:.3f} | {}",
+                               sim::nSolid, sim::nHazard, sim::nPad, sim::nOrb,
+                               sim::jumpVel, sim::grav, g.bot ? "bot" : "traj");
+
+        if (msg != f->lastStatus) {         // setString is expensive: only when it changed
+            f->lastStatus = msg;
+            f->status->setString(msg.c_str());
+        }
     }
 
     // ---------- HUD ----------
@@ -779,7 +952,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool show = g.counter || g.hudEdit;
         f->hud->setVisible(show);
 
-        // yellow tint while in "Move HUD" mode so it's obvious it can be dragged
         if (f->hudBg) f->hudBg->setColor(g.hudEdit ? ccColor3B{255, 220, 60} : ccColor3B{255, 255, 255});
     }
 
@@ -796,7 +968,7 @@ class $modify(BotPlayLayer, PlayLayer) {
             return;
         }
 
-        int gap = fromStepHook ? 6 : 2; // tiny gaps inside one contact don't count as a new death
+        int gap = fromStepHook ? 6 : 2;
         f->totalSteps++;
         if (hit) {
             if (f->stepsSinceHit <= gap) {
@@ -815,6 +987,7 @@ class $modify(BotPlayLayer, PlayLayer) {
     void onPhysicsStep() {
         auto f = m_fields.self();
         f->stepHookSeen = true;
+        f->stepsThisTick++;
         this->registerStep(true);
         this->sampleArc();
     }
@@ -835,20 +1008,36 @@ class $modify(BotPlayLayer, PlayLayer) {
                 f->arcStartX = f->arcPrevX;
                 f->arcStartY = f->arcPrevY;
                 f->arcApex = y - f->arcStartY;
+
+                // was this takeoff caused by a jump pad?
+                f->arcPad = -1;
+                sim::forEachNear(f->arcPrevX, [&](sim::Box const& b) {
+                    if (sim::isPad(b.kind) &&
+                        sim::overlap(f->arcPrevX, f->arcPrevY, sim::HALF + 6.f, b)) {
+                        f->arcPad = b.kind - sim::PadYellow;
+                    }
+                });
             }
         } else {
             f->arcApex = std::max(f->arcApex, y - f->arcStartY);
             float dx = x - f->arcStartX;
-            if (dx < 0.f || dx > f->vx * 70.f) {
-                f->arcActive = false;               // teleport / too long: ignore
+
+            sim::S probe;
+            probe.x = x; probe.y = y; probe.ground = ground;
+            if (dx < 0.f || dx > f->vx * 70.f || sim::findOrb(probe) >= 0) {
+                f->arcActive = false;               // teleport / too long / orb involved: ignore
             } else if (ground) {
                 f->arcActive = false;
                 float dy = y - f->arcStartY;
                 if (std::abs(dy) < 0.5f && f->vx > 1.f) {
-                    float airFrames = dx / f->vx;
-                    if (sim::calibrate(f->arcApex, airFrames)) {
-                        Mod::get()->setSavedValue<float>("jumpVel", sim::jumpVel);
-                        Mod::get()->setSavedValue<float>("grav", sim::grav);
+                    auto m = Mod::get();
+                    if (f->arcPad >= 0) {
+                        if (sim::calibratePad(f->arcPad, f->arcApex)) {
+                            m->setSavedValue<float>(fmt::format("padMul{}", f->arcPad), sim::padMul[f->arcPad]);
+                        }
+                    } else if (sim::calibrate(f->arcApex, dx / f->vx)) {
+                        m->setSavedValue<float>("jumpVel", sim::jumpVel);
+                        m->setSavedValue<float>("grav", sim::grav);
                     }
                 }
             }
@@ -905,16 +1094,31 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     // ---------- physics measurement ----------
+    // Uses the exact number of physics steps since the last tick, so velocity doesn't
+    // jitter with frame-time noise (that jitter is what made the trajectory shake).
     void measure(float dt) {
         if (!m_player1) return;
         auto f = m_fields.self();
         float x = m_player1->getPositionX();
         float y = m_player1->getPositionY();
 
-        if (f->haveLast && dt > 0.f) {
-            float k = 1.f / (dt * 60.f);
-            float dx = (x - f->lastX) * k;
-            float dy = (y - f->lastY) * k;
+        int steps = f->stepsThisTick;
+        f->stepsThisTick = 0;
+
+        float frames60;
+        if (f->stepHookSeen) {
+            if (dt > 0.0005f && dt < 0.1f) {
+                f->tpsEma = f->tpsEma * 0.98f + (static_cast<float>(steps) / dt) * 0.02f;
+            }
+            float tps = std::max(60.f, std::round(f->tpsEma / 60.f) * 60.f);
+            frames60 = static_cast<float>(steps) * (60.f / tps);
+        } else {
+            frames60 = dt * 60.f;
+        }
+
+        if (f->haveLast && frames60 > 0.f) {
+            float dx = (x - f->lastX) / frames60;
+            float dy = (y - f->lastY) / frames60;
             if (dx > 0.5f && dx < 20.f) f->vx = dx;     // ignore teleports/respawns
             f->vy = std::clamp(dy, -30.f, 30.f);
         }
@@ -938,13 +1142,34 @@ class $modify(BotPlayLayer, PlayLayer) {
         s.ground = m_player1->m_isOnGround;
         s.vy = s.ground ? 0.f : f->vy;
         s.dead = false;
+        s.lock = -1;
 
-        // learn the floor height: if we're grounded and not on a block, we're on the floor
+        // an orb the bot already pressed stays "used" while we're still touching it
+        if (f->lockIdx >= 0) {
+            if (f->lockIdx < static_cast<int>(sim::boxes.size()) &&
+                sim::overlap(s.x, s.y, sim::ORB_HALF + 4.f, sim::boxes[f->lockIdx])) {
+                s.lock = f->lockIdx;
+            } else {
+                f->lockIdx = -1;
+            }
+        }
+        // already launched by a pad we're still overlapping
+        if (!s.ground && s.vy > 2.f && s.lock < 0) {
+            int found = -1;
+            sim::forEachNear(s.x, [&](sim::Box const& b) {
+                if (sim::isPad(b.kind) && sim::overlap(s.x, s.y, sim::ORB_HALF, b)) {
+                    found = sim::indexOf(b);
+                }
+            });
+            if (found >= 0) s.lock = found;
+        }
+
+        // learn the floor height: grounded and not on a block => we're on the floor
         if (s.ground) {
             bool onBlock = false;
             float bottom = s.y - sim::HALF;
             sim::forEachNear(s.x, [&](sim::Box const& b) {
-                if (!b.hazard && std::abs(b.y1 - bottom) < 1.5f &&
+                if (b.kind == sim::Solid && std::abs(b.y1 - bottom) < 1.5f &&
                     s.x + sim::HALF > b.x0 && s.x - sim::HALF < b.x1) onBlock = true;
             });
             if (!onBlock && bottom > 84.f && bottom < 96.f) sim::floorY = bottom;
@@ -960,30 +1185,44 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (!g.trajectory || !this->cubeMode()) return;
 
         auto start = this->currentSimState();
+        int H = sim::horizon(f->vx);
 
-        auto drawPath = [&](bool firstJump, ccColor4F col) {
+        auto drawPath = [&](bool press, ccColor4F col) {
             auto s = start;
             auto prev = CCPoint{s.x, s.y};
-            int H = sim::horizon(f->vx);
             for (int i = 0; i < H; i++) {
-                sim::step(s, f->vx, firstJump && i == 0);
-                CCPoint p{s.x, s.y};
-                f->traj->drawSegment(prev, p, 1.2f, col);
-                prev = p;
+                sim::step(s, f->vx, press && i == 0);
+                if (i % 3 == 2 || s.dead) {            // coarse segments keep drawing cheap
+                    CCPoint p{s.x, s.y};
+                    f->traj->drawSegment(prev, p, 1.2f, col);
+                    prev = p;
+                }
                 if (s.dead) {
-                    f->traj->drawDot(p, 4.f, ccc4f(1.f, 0.f, 0.f, 1.f));
+                    f->traj->drawDot(prev, 4.f, ccc4f(1.f, 0.f, 0.f, 1.f));
                     break;
                 }
             }
         };
 
-        drawPath(false, ccc4f(1.f, 0.4f, 0.4f, 0.9f));                          // if you do nothing
-        if (start.ground) drawPath(true, ccc4f(0.3f, 1.f, 0.4f, 0.9f));         // if you jump now
+        drawPath(false, ccc4f(1.f, 0.4f, 0.4f, 0.9f));                              // if you do nothing
+        if (sim::canAct(start)) drawPath(true, ccc4f(0.3f, 1.f, 0.4f, 0.9f));       // if you press now
     }
 
     // ---------- bot ----------
-    // Looks ahead with the simulator, finds the window of frames in which a jump
-    // survives, and jumps in the middle of that window.
+    // Plans ONCE per obstacle (not every frame): finds the window of frames where a press
+    // survives, aims for its center (measured in x), then just waits for that position.
+    void botPress(sim::S const& s) {
+        auto f = m_fields.self();
+        if (!s.ground) {
+            f->lockIdx = sim::findOrb(s);   // remember the orb we're using
+        }
+        f->havePlan = false;
+        f->botHolding = true;
+        f->botRelease = 2;
+        f->cooldown = 3;
+        this->pressJump(true);
+    }
+
     void tickBot() {
         auto f = m_fields.self();
 
@@ -992,69 +1231,68 @@ class $modify(BotPlayLayer, PlayLayer) {
             f->botHolding = false;
             this->pressJump(false);
         }
+        if (f->cooldown > 0) f->cooldown--;
 
-        if (!this->cubeMode() || sim::boxes.empty()) return;
+        if (!this->cubeMode() || (sim::boxes.empty() && sim::wide.empty())) return;
         if (f->botHolding) return;
 
         auto s = this->currentSimState();
-        if (!s.ground) return;
-
         sim::Planner p;
         p.vx = f->vx;
         p.H = sim::horizon(p.vx);
 
-        // forget a stale plan (we've already driven past it)
-        if (f->havePlan && f->planX < s.x - 2.f * p.vx) f->havePlan = false;
+        if (f->havePlan && f->planX < s.x - 2.f * p.vx) f->havePlan = false; // stale
 
-        // 1) Can we just keep going without jumping?
-        p.budget = 30000;
-        if (p.survive(s, 0, 0)) {
-            f->havePlan = false;
+        bool act = sim::canAct(s);
+
+        // execute an existing plan
+        if (f->havePlan) {
+            if (act && s.x + p.vx * 0.5f >= f->planX) this->botPress(s);
             return;
         }
 
-        // 2) Find the contiguous window of "jump now"-frames that survive
+        if (f->cooldown > 0) return;
+        if (f->retry > 0) { f->retry--; return; }
+
+        // 1) Is there any danger ahead if we do nothing?
+        p.budget = 30000;
+        if (p.survive(s, 0, 0)) return;
+
+        // 2) Find the window of press-frames that lead to survival (up to 2 more presses after it)
         int first = -1, last = -1;
         auto w = s;
-        p.budget = 80000;
-        for (int k = 0; k < 50; k++) {
-            auto j = w;
-            sim::step(j, p.vx, true);
-            bool ok = !j.dead && p.survive(j, 1, 1);
-            if (ok) {
-                if (first < 0) first = k;
-                last = k;
-            } else if (first >= 0) {
-                break;
+        for (int k = 0; k < 60; k++) {
+            if (sim::canAct(w)) {
+                auto j = w;
+                sim::step(j, p.vx, true);
+                p.budget = 6000;
+                bool ok = !j.dead && p.survive(j, 1, 2);
+                if (ok) {
+                    if (first < 0) first = k;
+                    last = k;
+                } else if (first >= 0) {
+                    break;
+                }
             }
             sim::step(w, p.vx, false);
-            if (w.dead || !w.ground) break;
+            if (w.dead) break;
         }
 
-        // 3) Aim for the CENTER of the window (measured in x, so speed changes don't matter)
-        bool doJump = false;
         if (first < 0) {
-            doJump = true; // no safe window found: try anyway
-        } else {
-            float centerX = s.x + p.vx * (first + last) * 0.5f;
-            if (first > 0) {
-                f->havePlan = true;       // window still ahead: keep refining the target
-                f->planX = centerX;
-            } else {
-                if (!f->havePlan) {       // window already open and we never saw it coming
-                    f->havePlan = true;
-                    f->planX = centerX;
-                }
-                if (s.x + p.vx * 0.5f >= f->planX || last <= 1) doJump = true;
-            }
+            // no safe window found: press now if we can, otherwise look again shortly
+            if (act) this->botPress(s);
+            else f->retry = 8;
+            return;
         }
 
-        if (doJump) {
-            f->havePlan = false;
-            f->botHolding = true;
-            f->botRelease = 2;
-            this->pressJump(true);
+        // 3) aim for the CENTER of the window
+        float centerX = s.x + p.vx * (first + last) * 0.5f;
+        if (first == 0 && (last <= 1 || s.x + p.vx * 0.5f >= centerX) && act) {
+            this->botPress(s);
+            return;
         }
+        f->havePlan = true;
+        f->planX = centerX;
     }
 
     // ---------- layout mode ----------
@@ -1084,10 +1322,9 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 };
 
-
 // ===============================================================
 // Per-physics-step hook (240 steps/s on most setups). Used for exact
-// noclip stats and to measure real jumps for auto-calibration.
+// noclip stats, exact velocity measurement and jump auto-calibration.
 // ===============================================================
 class $modify(StepPlayer, PlayerObject) {
     void update(float dt) {
