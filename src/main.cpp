@@ -97,12 +97,12 @@ namespace sim {
     inline std::vector<Box> wide;
     inline float maxW = 30.f;
     inline float floorY = 90.f;
-    inline float ceilY = 570.f;
+    inline float ceilY = 600.f; // Give a little extra headroom
     inline int nSolid = 0, nHazard = 0, nPad = 0, nOrb = 0, nPortal = 0;
 
     constexpr float HALF = 15.f;
-    constexpr float HAZ_HALF = 7.5f; // Accurate spike hitbox
-    constexpr float ORB_HALF = 10.f; 
+    constexpr float HAZ_HALF = 11.f; // Slightly forgiving spike hitbox
+    constexpr float ORB_HALF = 12.f; 
     constexpr float TERMINAL = -15.f;
     constexpr int SUB = 2;
 
@@ -112,7 +112,7 @@ namespace sim {
 
     inline float launch[KindCount] = {
         0.f, 0.f, 0.f, 0.f,
-        1.43f, 0.93f, 1.79f, -0.9f,
+        1.40f, 0.93f, 1.79f, -0.9f,
         1.00f, 0.68f, 1.30f, -1.1f, -1.3f
     };
 
@@ -171,12 +171,13 @@ namespace sim {
         if (s.dead) return;
 
         if (press) {
-            if (s.ground) {
+            // ORB PRIORITY: Check for orbs first, even if on the ground
+            int o = findOrb(s);
+            if (o >= 0) {
+                activate(s, boxes[o], o);
+            } else if (s.ground) {
                 s.vy = jumpVel;
                 s.ground = false;
-            } else {
-                int o = findOrb(s);
-                if (o >= 0) activate(s, boxes[o], o);
             }
         }
 
@@ -891,10 +892,18 @@ class $modify(BotPlayLayer, PlayLayer) {
             CCRect r;
 
             if (sim::isOrb(kind)) {
-                r = CCRect(pos.x + 15.f - 15.f, pos.y + 15.f - 15.f, 30.f, 30.f);
+                r = obj->getObjectRect();
+                r.origin.x += 2.f; r.origin.y += 2.f; r.size.width -= 4.f; r.size.height -= 4.f;
+            } else if (sim::isPad(kind)) {
+                r = obj->getObjectRect();
+                r.origin.y -= 2.f;
+                r.size.height += 4.f;
             } else if (kind == sim::Hazard) {
-                // Real GD spike hitbox is exactly 15x15 at the bottom center
-                r = CCRect(pos.x + 7.5f, pos.y, 15.f, 15.f);
+                r = obj->getObjectRect();
+                float cx = r.origin.x + r.size.width * 0.5f;
+                r.origin.x = cx - 7.5f;
+                r.size.width = 15.f;
+                r.size.height = 15.f; // Keep height from bottom
             } else {
                 r = obj->getObjectRect();
                 float mx = r.origin.x + r.size.width * 0.5f;
@@ -905,8 +914,6 @@ class $modify(BotPlayLayer, PlayLayer) {
                     auto bb = obj->boundingBox();
                     if (sim::isPortal(kind)) {
                         r = CCRect(pos.x - 10.f, bb.origin.y, 20.f, bb.size.height);
-                    } else if (sim::isPad(kind)) {
-                        r = CCRect(pos.x - 15.f, pos.y - 15.f, 30.f, 12.f);
                     } else {
                         r = bb;
                     }
@@ -958,7 +965,6 @@ class $modify(BotPlayLayer, PlayLayer) {
             m_fields->hitFlag = true;
             return;
         }
-        // Reset velocity tracking to prevent weird gravity after death
         m_fields->haveLast = false;
         m_fields->vy = 0.f;
         PlayLayer::destroyPlayer(player, object);
@@ -1211,7 +1217,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         s.dead = false;
         s.lock = -1;
 
-        // STRICT ground check. If falling or rising fast, we are NOT on the ground.
         bool geomGround = this->isOnLocalGround(s.x, s.y, flip);
         bool isMoving = std::abs(m_player1->m_yVelocity) > 2.0f;
         s.ground = (geomGround || m_player1->m_isOnGround) && !isMoving;
@@ -1319,7 +1324,8 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         if (g.bot && f->havePlan) {
             int planFrame = static_cast<int>(std::round((f->planX - start.x) / f->vx));
-            if (planFrame > 0 && planFrame < H) {
+            if (planFrame >= 0) {
+                planFrame = std::min(planFrame, H - 1);
                 drawPath(false, planFrame, ccc4f(0.35f, 0.65f, 1.f, 0.9f));
                 f->traj->drawDot(CCPoint{start.x + f->vx * planFrame, start.y},
                                  6.f, ccc4f(0.35f, 0.65f, 1.f, 1.f));
@@ -1403,9 +1409,9 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         auto s = this->currentSimState();
         
-        // Strict check: never press in mid-air without an orb
         if (!s.ground && sim::findOrb(s) < 0) {
             f->havePlan = false;
+            f->trajDirty = true;
             return; 
         }
 
@@ -1423,20 +1429,15 @@ class $modify(BotPlayLayer, PlayLayer) {
             }
             f->planIdle = 0;
 
-            bool reachAim = act && s.x + p.vx * 0.5f >= f->planX;
-            bool deadline = act && s.x + p.vx * 0.5f >= f->planDeadlineX;
-            if (reachAim || deadline) {
+            if (act && s.x + p.vx * 0.5f >= f->planX) {
                 this->botPress(s);
                 return;
             }
-
-            if (s.x > f->planDeadlineX + p.vx * 4.f) { f->havePlan = false; f->trajDirty = true; }
             return;
         }
 
         if (d < 0) return;
         if (f->cooldown > 0) return;
-        if (f->retry > 0) { f->retry--; return; }
 
         auto scan = [&](int extra, int& first, int& last) {
             first = last = -1;
@@ -1468,21 +1469,13 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         if (first < 0) {
             if (act && d <= 4) this->botPress(s, 12);
-            else f->retry = 2;
             return;
         }
 
         float firstX = s.x + p.vx * first;
         float lastX  = s.x + p.vx * last;
-        
-        // FIX: Aim for the EARLIEST possible frame to clear the spike
-        float aimX = firstX + p.vx * 0.5f; 
-        if (aimX > lastX) aimX = lastX; // Ensure we are still inside the safe window
+        float aimX = firstX + (lastX - firstX) * 0.5f;
 
-        if (first == 0 && last <= 1) {
-            this->botPress(s);
-            return;
-        }
         if (act && s.x + p.vx * 0.5f >= aimX) {
             this->botPress(s);
             return;
