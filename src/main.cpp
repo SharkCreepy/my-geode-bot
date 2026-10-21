@@ -8,22 +8,21 @@ bool g_noclipEnabled = false;
 bool g_autoClickerEnabled = false;
 bool g_layoutModeEnabled = false;
 
-// Updated for Geode v5: No more angle brackets <>
 class MyBotMenu : public Popup { 
 protected:
-    // Updated for Geode v5: No arguments in init()
     bool init() override { 
-        // We set the size here instead
+        // Set popup size to 280x180
         if (!Popup::init(280.f, 180.f)) return false;
 
         this->setTitle("Bot Menu");
 
+        // Center the menu inside the popup
         auto menu = CCMenu::create();
-        menu->setPosition({0, 0});
-        // Updated for Geode v5: Add to m_mainLayer instead of 'this'
+        menu->setPosition({140.f, 90.f}); 
         this->m_mainLayer->addChild(menu); 
 
-        auto createToggle = [&](const char* text, bool& value, const CCPoint& pos) {
+        // Helper to create perfectly aligned toggles
+        auto createToggle = [&](const char* text, bool& value, float yPos) {
             auto label = CCLabelBMFont::create(text, "bigFont.fnt");
             label->setScale(0.6f);
             
@@ -33,18 +32,21 @@ protected:
             auto toggleBtn = CCMenuItemToggler::create(
                 spriteOff, spriteOn, this, menu_selector(MyBotMenu::onToggle)
             );
-            toggleBtn->setPosition(pos);
+            
+            // Place toggle on the left side (-60), text on the right side (+20)
+            toggleBtn->setPosition({-60.f, yPos});
             toggleBtn->toggle(value);
             toggleBtn->setUserData(&value); 
             menu->addChild(toggleBtn);
 
-            label->setPosition(pos + CCPoint{30.f, 0.f});
+            label->setPosition({20.f, yPos});
             menu->addChild(label);
         };
 
-        createToggle("Noclip", g_noclipEnabled, {60.f, 100.f});
-        createToggle("Autoclicker", g_autoClickerEnabled, {60.f, 60.f});
-        createToggle("Layout Mode", g_layoutModeEnabled, {60.f, 20.f});
+        // Vertical spacing of 40 pixels between each option
+        createToggle("Noclip", g_noclipEnabled, 40.f);
+        createToggle("Autoclicker", g_autoClickerEnabled, 0.f);
+        createToggle("Layout Mode", g_layoutModeEnabled, -40.f);
 
         return true;
     }
@@ -83,8 +85,9 @@ class $modify(MyPlayLayer, PlayLayer) {
             menuBtnSprite, nullptr, this, menu_selector(MyPlayLayer::onOpenMenu)
         );
         
+        // Moved the button to the top-left corner so it doesn't clash with the Pause button
         auto winSize = CCDirector::sharedDirector()->getWinSize();
-        menuBtn->setPosition({winSize.width - 30.f, winSize.height - 30.f});
+        menuBtn->setPosition({30.f, winSize.height - 30.f});
         
         auto buttonMenu = CCMenu::create(menuBtn, nullptr);
         buttonMenu->setPosition({0, 0});
