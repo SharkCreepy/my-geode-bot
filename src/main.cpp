@@ -13,12 +13,7 @@
 
 using namespace geode::prelude;
 
-// Draw what the bot "sees" (cyan = solid, red = hazard, yellow = slope, purple = orb/pad/portal)
-// whenever Trajectory is on. Set to false once everything looks right.
 constexpr bool SHOW_SIM_BOXES = true;
-// Which corner holds the right angle on an unrotated, unflipped slope:
-// 0 = bottom-left, 1 = bottom-right, 2 = top-left, 3 = top-right.
-// If the yellow debug triangles look mirrored, change this.
 constexpr int SLOPE_BASE_CORNER = 1;
 
 struct State {
@@ -50,9 +45,6 @@ $on_mod(Loaded) {
     g.load();
 }
 
-// ===============================================================
-// Cube physics simulator
-// ===============================================================
 namespace sim {
     enum Kind : int {
         Solid = 0, Hazard,
@@ -74,7 +66,7 @@ namespace sim {
 
     constexpr float HALF = 15.f;
     constexpr float HAZ_HALF = 14.f;
-    constexpr float ORB_HALF = 15.f; // Increased to match player hitbox for easier activation
+    constexpr float ORB_HALF = 12.f;
     constexpr float TERMINAL = -15.f;
     constexpr int SUB = 2;
 
@@ -224,7 +216,7 @@ namespace sim {
                     ly = by0 - HALF;
                     s.y = ly * up;
                     s.vy = 0.f;
-                    s.dead = true; // Hit ceiling
+                    // Note: Hitting a ceiling does NOT kill you, it just stops your upward momentum
                 }
             });
             if (s.dead) break;
@@ -261,8 +253,10 @@ namespace sim {
                                     ? (right ? (b.y1 - Hh * t) : (b.y0 + Hh * t))
                                     : (right ? (b.y0 + Hh * t) : (b.y1 - Hh * t));
                                 
+                                // Fix: Only snap to the slope surface if we are landing on it from above.
+                                // Hitting a slope from the side or bottom should result in death.
                                 if (!s.flip) {
-                                    if (s.y + HALF < surfY) {
+                                    if (s.y + HALF < surfY - 5.f) { 
                                         s.dead = true; 
                                     } else {
                                         s.y = surfY + HALF;
@@ -270,7 +264,7 @@ namespace sim {
                                         s.ground = true;
                                     }
                                 } else {
-                                    if (s.y - HALF > surfY) {
+                                    if (s.y - HALF > surfY + 5.f) {
                                         s.dead = true;
                                     } else {
                                         s.y = surfY - HALF;
@@ -333,7 +327,7 @@ namespace sim {
         struct Cand { int f; S s; };
 
         bool survive(S s, int frame, int pressesLeft) {
-            Cand cands[128];
+            Cand cands[64];
             int nc = 0;
             S t = s;
             int f = frame;
@@ -341,8 +335,7 @@ namespace sim {
 
             while (f < H) {
                 if (--budget <= 0) return false;
-                // Check every frame for a potential orb/ground click
-                if (pressesLeft > 0 && nc < 128 && canAct(t)) {
+                if (pressesLeft > 0 && (f & 1) == 0 && nc < 64 && canAct(t)) {
                     cands[nc++] = {f, t};
                 }
                 step(t, vx, false);
@@ -361,9 +354,6 @@ namespace sim {
     };
 }
 
-// ===============================================================
-// Wave physics (hold = up, release = down; flipped gravity inverts)
-// ===============================================================
 namespace waveSim {
     constexpr float HALF = 4.f;       
     constexpr float HAZ_HALF = 4.f;   
@@ -455,9 +445,6 @@ namespace waveSim {
     }
 }
 
-// ===============================================================
-// Menu popup
-// ===============================================================
 class BotMenu : public Popup {
 protected:
     bool init() {
@@ -510,9 +497,6 @@ public:
     }
 };
 
-// ===============================================================
-// Layout Mode
-// ===============================================================
 class $modify(LayoutGameObject, GameObject) {
     void setVisible(bool v) {
         if (g.layout && m_objectType == GameObjectType::Decoration) v = false;
@@ -520,9 +504,6 @@ class $modify(LayoutGameObject, GameObject) {
     }
 };
 
-// ===============================================================
-// Infinite Jump
-// ===============================================================
 class $modify(JumpPlayer, PlayerObject) {
     bool pushButton(PlayerButton btn) {
         if (g.jump && btn == PlayerButton::Jump && PlayLayer::get()) {
@@ -532,9 +513,6 @@ class $modify(JumpPlayer, PlayerObject) {
     }
 };
 
-// ===============================================================
-// Ticker
-// ===============================================================
 class Ticker : public CCNode {
 protected:
     std::function<void(float)> m_fn;
@@ -557,9 +535,6 @@ public:
     }
 };
 
-// ===============================================================
-// PlayLayer hook
-// ===============================================================
 static int slopeCorner(GameObject* obj) {
     float q90 = obj->getRotation() / 90.f;
     if (std::abs(q90 - std::round(q90)) > 0.03f) return -1;
@@ -616,21 +591,21 @@ class $modify(BotPlayLayer, PlayLayer) {
         float ly = y * up;
         float floorL = flip ? -sim::ceilY : sim::floorY;
 
-        if (std::abs((ly - sim::HALF) - floorL) < 3.f) return true;
+        if (std::abs((ly - sim::HALF) - floorL) < 2.5f) return true;
 
         bool onBlock = false;
         sim::forEachNear(x, [&](sim::Box const& b) {
             if (b.kind != sim::Solid) return;
             float by1 = flip ? -b.y0 : b.y1;
-            if (x + sim::HALF > b.x0 && x - sim::HALF < b.x1 + 4.0f && 
-                std::abs((ly - sim::HALF) - by1) < 4.0f) onBlock = true;
+            if (x + sim::HALF > b.x0 && x - sim::HALF < b.x1 + 1.0f && 
+                std::abs((ly - sim::HALF) - by1) < 2.0f) onBlock = true;
         });
         
         bool onSlope = false;
         if (!onBlock) {
             sim::forEachNear(x, [&](sim::Box const& b) {
                 if (onSlope || b.kind != sim::Slope) return;
-                if (x < b.x0 - 4.f || x > b.x1 + 4.f) return;
+                if (x < b.x0 || x > b.x1) return;
                 float W = b.x1 - b.x0, Hh = b.y1 - b.y0;
                 if (W < 1.f || Hh < 1.f) return;
                 float t = (x - b.x0) / W;
@@ -638,7 +613,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                 bool top   = (b.corner & 2) != 0;
                 if (top) return;   
                 float surfY = right ? (b.y0 + Hh * t) : (b.y1 - Hh * t);
-                if (std::abs((ly - sim::HALF) - surfY) < 4.5f) onSlope = true;
+                if (std::abs((ly - sim::HALF) - surfY) < 2.5f) onSlope = true;
             });
         }
         return onBlock || onSlope;
@@ -948,9 +923,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         s.dead = false;
         s.lock = -1;
 
-        bool geomGround = this->isOnLocalGround(s.x, s.y, flip);
-        s.ground = geomGround || (m_player1->m_isOnGround && std::abs(m_player1->m_yVelocity) < 4.0f);
-
+        s.ground = this->isOnLocalGround(s.x, s.y, flip);
         s.vy = s.ground ? 0.f : f->vy * up;
 
         if (f->lockIdx >= 0) {
@@ -1059,8 +1032,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto f = m_fields.self();
         int H = sim::horizon(f->vx);
 
-        auto drawPath = [&](bool pressNow, int pressFrame, ccColor4F col) {
-            auto s = start;
+        auto drawPath = [&](sim::S st, bool pressNow, int pressFrame, ccColor4F col) {
+            auto s = st;
             auto prev = CCPoint{s.x, s.y};
             CCPoint end = prev;
             bool died = false;
@@ -1082,16 +1055,17 @@ class $modify(BotPlayLayer, PlayLayer) {
         };
 
         // Red = Do nothing (will die)
-        drawPath(false, -1, ccc4f(1.f, 0.4f, 0.4f, 0.9f));
-        // Green = Jump right now
-        if (sim::canAct(start)) drawPath(true, -1, ccc4f(0.3f, 1.f, 0.4f, 0.9f));
+        drawPath(start, false, -1, ccc4f(1.f, 0.4f, 0.4f, 0.9f));
+
+        // Green = Jump right now (or click orb if in range)
+        if (sim::canAct(start)) drawPath(start, true, -1, ccc4f(0.3f, 1.f, 0.4f, 0.9f));
 
         // Blue = The bot's current plan
         if (g.bot && f->havePlan) {
             int planFrame = static_cast<int>(std::round((f->planX - start.x) / f->vx));
             if (planFrame >= 0) {
                 planFrame = std::min(planFrame, H - 1);
-                drawPath(false, planFrame, ccc4f(0.35f, 0.65f, 1.f, 0.9f));
+                drawPath(start, false, planFrame, ccc4f(0.35f, 0.65f, 1.f, 0.9f));
                 
                 // Draw a big dot showing exactly where the bot will click
                 auto s = start;
@@ -1234,18 +1208,16 @@ class $modify(BotPlayLayer, PlayLayer) {
             p.vx = vx;
             p.H = H;
 
-            // Try 0 extra jumps, then 2 extra jumps
             for (int extra : {0, 2}) {
                 int bestFirst = -1, bestLast = -1, runFirst = -1;
                 auto w = s;
                 for (int k = 0; k <= dm; k++) {
                     if (!sim::canAct(w)) {
                         runFirst = -1;
-                    } else {
-                        // Check all frames for potential clicks (Orbs/Pads)
+                    } else if (extra == 0 || (k & 1) == 0) {
                         auto j = w;
                         sim::step(j, vx, true);
-                        p.budget = extra == 0 ? 10000 : 15000;
+                        p.budget = extra == 0 ? 8000 : 15000;
                         if (!j.dead && p.survive(j, 1, extra)) {
                             if (runFirst < 0) runFirst = k;
                             if (bestFirst < 0 || (k - runFirst) >= (bestLast - bestFirst)) {
@@ -1260,11 +1232,9 @@ class $modify(BotPlayLayer, PlayLayer) {
                     if (w.dead) break;
                 }
                 if (bestFirst >= 0) {
-                    int jumpFrame = bestFirst;
-                    // If we are on the ground, delay the jump slightly to avoid jumping too early
-                    if (s.ground) {
-                        jumpFrame += std::min(2, (bestLast - bestFirst) / 2);
-                    }
+                    // Aim for the last possible safe frame (or close to it).
+                    // Jumping late prevents the bot from hitting ceilings or jumping unnecessarily early.
+                    int jumpFrame = std::max(bestFirst, bestLast - 1);
                     aimX = s.x + vx * jumpFrame;
                     lastX = s.x + vx * bestLast;
                     return true;
@@ -1320,9 +1290,6 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 };
 
-// ===============================================================
-// Per-physics-step hook
-// ===============================================================
 class $modify(StepPlayer, PlayerObject) {
     void update(float dt) {
         if (auto pl = PlayLayer::get()) {
