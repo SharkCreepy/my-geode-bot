@@ -1,5 +1,7 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/PlayerObject.hpp>
+#include <Geode/modify/GameObject.hpp>
 #include <Geode/ui/Popup.hpp>
 #include <functional>
 #include <algorithm>
@@ -8,22 +10,56 @@
 using namespace geode::prelude;
 
 // ---------------------------------------------------------------
-// Settings (saved between sessions)
+// Shared state (cached in memory, saved to disk when changed)
 // ---------------------------------------------------------------
-namespace cfg {
-    inline bool get(char const* key) {
-        return Mod::get()->getSavedValue<bool>(key, false);
+struct State {
+    bool noclip = false;
+    bool counter = false;     // show noclip hits / accuracy
+    bool jump = false;        // infinite jump
+    bool clicker = false;
+    bool layout = false;
+    bool speedOn = false;
+    float speed = 1.f;
+    float cps = 10.f;
+
+    void load() {
+        auto m = Mod::get();
+        noclip  = m->getSavedValue<bool>("noclip", false);
+        counter = m->getSavedValue<bool>("counter", false);
+        jump    = m->getSavedValue<bool>("jump", false);
+        clicker = m->getSavedValue<bool>("clicker", false);
+        layout  = m->getSavedValue<bool>("layout", false);
+        speedOn = m->getSavedValue<bool>("speedOn", false);
+        speed   = m->getSavedValue<float>("speed", 1.f);
+        cps     = m->getSavedValue<float>("cps", 10.f);
     }
-    inline void set(char const* key, bool v) {
-        Mod::get()->setSavedValue<bool>(key, v);
+
+    void save() {
+        auto m = Mod::get();
+        m->setSavedValue<bool>("noclip", noclip);
+        m->setSavedValue<bool>("counter", counter);
+        m->setSavedValue<bool>("jump", jump);
+        m->setSavedValue<bool>("clicker", clicker);
+        m->setSavedValue<bool>("layout", layout);
+        m->setSavedValue<bool>("speedOn", speedOn);
+        m->setSavedValue<float>("speed", speed);
+        m->setSavedValue<float>("cps", cps);
     }
-    constexpr float CLICKS_PER_SECOND = 10.f;
-    constexpr float HOLD_TIME = 0.04f;
+};
+
+inline State g;
+
+$on_mod(Loaded) {
+    g.load();
+}
+
+static void resetTimeScale() {
+    auto sched = CCDirector::sharedDirector()->getScheduler();
+    if (sched && sched->getTimeScale() != 1.f) sched->setTimeScale(1.f);
 }
 
 // ---------------------------------------------------------------
-// Draggable floating button
-// Tap = open menu, drag = move (position is saved)
+// Draggable floating button (tap = open menu, drag = move)
 // ---------------------------------------------------------------
 class DraggableButton : public CCNode, public CCTouchDelegate {
 protected:
@@ -46,7 +82,6 @@ protected:
         return true;
     }
 
-    // Is this node actually on screen and usable?
     bool isUsable() {
         for (CCNode* n = this; n; n = n->getParent()) {
             if (!n->isVisible()) return false;
@@ -72,6 +107,7 @@ public:
 
     void onExit() override {
         CCTouchDispatcher::get()->removeDelegate(this);
+        resetTimeScale(); // never leave the whole game sped up after leaving a level
         CCNode::onExit();
     }
 
@@ -91,7 +127,7 @@ public:
             ? this->getParent()->convertToNodeSpace(touch->getLocation())
             : touch->getLocation();
         m_visual->setScale(0.92f);
-        return true; // swallow so the game doesn't also register a jump
+        return true;
     }
 
     void ccTouchMoved(CCTouch* touch, CCEvent*) override {
@@ -141,37 +177,88 @@ public:
 // ---------------------------------------------------------------
 class BotMenu : public Popup {
 protected:
+    CCLabelBMFont* m_speedLabel = nullptr;
+    CCLabelBMFont* m_cpsLabel = nullptr;
+
     bool init() {
-        if (!Popup::init(280.f, 190.f)) return false;
+        if (!Popup::init(340.f, 230.f)) return false;
         this->setTitle("Bot Menu");
 
         auto menu = CCMenu::create();
-        menu->setPosition({140.f, 90.f});
+        menu->setPosition({170.f, 115.f});
         m_mainLayer->addChild(menu);
 
-        this->addToggle(menu, "Noclip", "noclip", 40.f);
-        this->addToggle(menu, "Autoclicker", "autoclicker", 0.f);
-        this->addToggle(menu, "Layout Mode", "layout", -40.f);
+        // two columns of toggles
+        this->addToggle(menu, "Noclip",        g.noclip,  -140.f, 70.f);
+        this->addToggle(menu, "Noclip Stats",  g.counter,   20.f, 70.f);
+        this->addToggle(menu, "Autoclicker",   g.clicker, -140.f, 40.f);
+        this->addToggle(menu, "Infinite Jump", g.jump,      20.f, 40.f);
+        this->addToggle(menu, "Layout Mode",   g.layout,  -140.f, 10.f);
+        this->addToggle(menu, "Speedhack",     g.speedOn,   20.f, 10.f);
+
+        // value steppers
+        m_speedLabel = this->addStepper(menu, -30.f, [this](int dir) {
+            g.speed = std::clamp(std::round((g.speed + dir * 0.1f) * 10.f) / 10.f, 0.1f, 5.f);
+            g.save();
+            m_speedLabel->setString(fmt::format("Speed: {:.1f}x", g.speed).c_str());
+        });
+        m_speedLabel->setString(fmt::format("Speed: {:.1f}x", g.speed).c_str());
+
+        m_cpsLabel = this->addStepper(menu, -65.f, [this](int dir) {
+            g.cps = std::clamp(std::round(g.cps + dir), 1.f, 30.f);
+            g.save();
+            m_cpsLabel->setString(fmt::format("Click CPS: {:.0f}", g.cps).c_str());
+        });
+        m_cpsLabel->setString(fmt::format("Click CPS: {:.0f}", g.cps).c_str());
+
         return true;
     }
 
-    void addToggle(CCMenu* menu, char const* text, char const* key, float y) {
+    void addToggle(CCMenu* menu, char const* text, bool& ref, float x, float y) {
         auto on = CCSprite::createWithSpriteFrameName("GJ_checkOn_001.png");
         auto off = CCSprite::createWithSpriteFrameName("GJ_checkOff_001.png");
 
-        auto toggler = CCMenuItemExt::createToggler(on, off, [key](CCMenuItemToggler* t) {
-            // callback runs before the visual state flips
-            cfg::set(key, !t->isToggled());
+        bool* p = &ref; // g is a global, so this pointer stays valid
+        auto toggler = CCMenuItemExt::createToggler(on, off, [p](CCMenuItemToggler* t) {
+            *p = !t->isToggled(); // callback fires before the visual flips
+            g.save();
         });
-        toggler->toggle(cfg::get(key));
-        toggler->setPosition({-80.f, y});
+        toggler->setScale(0.6f);
+        toggler->toggle(ref);
+        toggler->setPosition({x, y});
         menu->addChild(toggler);
 
         auto label = CCLabelBMFont::create(text, "bigFont.fnt");
-        label->setScale(0.55f);
+        label->setScale(0.42f);
         label->setAnchorPoint({0.f, 0.5f});
-        label->setPosition({-55.f, y});
+        label->setPosition({x + 20.f, y});
         menu->addChild(label);
+    }
+
+    CCLabelBMFont* addStepper(CCMenu* menu, float y, std::function<void(int)> change) {
+        auto label = CCLabelBMFont::create("", "bigFont.fnt");
+        label->setScale(0.5f);
+        label->setPosition({0.f, y});
+        menu->addChild(label);
+
+        auto leftSpr = CCSprite::createWithSpriteFrameName("navArrowBtn_001.png");
+        leftSpr->setFlipX(true);
+        leftSpr->setScale(0.6f);
+        auto left = CCMenuItemExt::createSpriteExtra(leftSpr, [change](CCMenuItemSpriteExtra*) {
+            change(-1);
+        });
+        left->setPosition({-105.f, y});
+        menu->addChild(left);
+
+        auto rightSpr = CCSprite::createWithSpriteFrameName("navArrowBtn_001.png");
+        rightSpr->setScale(0.6f);
+        auto right = CCMenuItemExt::createSpriteExtra(rightSpr, [change](CCMenuItemSpriteExtra*) {
+            change(1);
+        });
+        right->setPosition({105.f, y});
+        menu->addChild(right);
+
+        return label;
     }
 
 public:
@@ -187,20 +274,57 @@ public:
 };
 
 // ---------------------------------------------------------------
+// Layout Mode: decorations get hidden at the source.
+// GD's object culling calls setVisible every frame and would undo
+// a one-time hide, so we intercept it here instead.
+// ---------------------------------------------------------------
+class $modify(LayoutGameObject, GameObject) {
+    void setVisible(bool v) {
+        if (g.layout && m_objectType == GameObjectType::Decoration) v = false;
+        GameObject::setVisible(v);
+    }
+};
+
+// ---------------------------------------------------------------
+// Infinite Jump
+// ---------------------------------------------------------------
+class $modify(JumpPlayer, PlayerObject) {
+    bool pushButton(PlayerButton btn) {
+        if (g.jump && btn == PlayerButton::Jump && PlayLayer::get()) {
+            m_isOnGround = true;
+        }
+        return PlayerObject::pushButton(btn);
+    }
+};
+
+// ---------------------------------------------------------------
 // PlayLayer hook
 // ---------------------------------------------------------------
 class $modify(BotPlayLayer, PlayLayer) {
     struct Fields {
+        // layout
         bool prevLayout = false;
+        // autoclicker
         float clickTimer = 0.f;
         float holdTimer = 0.f;
         bool holding = false;
+        // noclip stats
+        bool hitThisFrame = false;
+        bool hitLastFrame = false;
+        int hits = 0;
+        int totalFrames = 0;
+        int deadFrames = 0;
+        int labelTick = 0;
+        CCLabelBMFont* statsLabel = nullptr;
     };
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
-        // Button visual
+        auto win = CCDirector::sharedDirector()->getWinSize();
+        CCNode* parent = m_uiLayer ? static_cast<CCNode*>(m_uiLayer) : static_cast<CCNode*>(this);
+
+        // menu button
         auto bg = extension::CCScale9Sprite::create("square02_small.png");
         bg->setContentSize({45.f, 45.f});
         bg->setOpacity(110);
@@ -211,61 +335,107 @@ class $modify(BotPlayLayer, PlayLayer) {
             bg->addChild(icon);
         }
 
-        auto btn = DraggableButton::create(bg, [] {
-            BotMenu::create()->show();
-        });
-        if (!btn) return true;
+        if (auto btn = DraggableButton::create(bg, [] { BotMenu::create()->show(); })) {
+            float x = Mod::get()->getSavedValue<float>("btn-x", 40.f);
+            float y = Mod::get()->getSavedValue<float>("btn-y", win.height - 40.f);
+            btn->setPosition({
+                std::clamp(x, 25.f, win.width - 25.f),
+                std::clamp(y, 25.f, win.height - 25.f)
+            });
+            parent->addChild(btn, 1000);
+        }
 
-        auto win = CCDirector::sharedDirector()->getWinSize();
-        float x = Mod::get()->getSavedValue<float>("btn-x", 40.f);
-        float y = Mod::get()->getSavedValue<float>("btn-y", win.height - 40.f);
-        btn->setPosition({
-            std::clamp(x, 25.f, win.width - 25.f),
-            std::clamp(y, 25.f, win.height - 25.f)
-        });
-
-        // UILayer lives inside the PlayLayer's own scene, so it's never the wrong scene
-        if (m_uiLayer) m_uiLayer->addChild(btn, 1000);
-        else this->addChild(btn, 1000);
+        // noclip stats label
+        auto label = CCLabelBMFont::create("", "bigFont.fnt");
+        label->setScale(0.4f);
+        label->setOpacity(170);
+        label->setPosition({win.width / 2.f, win.height - 14.f});
+        label->setVisible(false);
+        parent->addChild(label, 999);
+        m_fields->statsLabel = label;
 
         return true;
     }
 
+    // ---- noclip ----
     void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (cfg::get("noclip")) return;
+        if (g.noclip) {
+            m_fields->hitThisFrame = true;
+            return;
+        }
         PlayLayer::destroyPlayer(player, object);
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
-        m_fields->clickTimer = 0.f;
-        m_fields->holdTimer = 0.f;
-        m_fields->holding = false;
-        // objects get reset, so re-apply layout visuals
-        this->applyLayoutMode(cfg::get("layout"));
+        auto f = m_fields.self();
+        f->clickTimer = 0.f;
+        f->holdTimer = 0.f;
+        f->holding = false;
+        f->hits = 0;
+        f->totalFrames = 0;
+        f->deadFrames = 0;
+        f->hitThisFrame = false;
+        f->hitLastFrame = false;
+        this->applyLayoutMode(g.layout);
     }
 
     void onQuit() {
-        // restore anything we touched
-        this->applyLayoutMode(false);
+        resetTimeScale();
         PlayLayer::onQuit();
     }
 
+    // ---- per-frame ----
     void update(float dt) {
+        // speedhack
+        auto sched = CCDirector::sharedDirector()->getScheduler();
+        float target = g.speedOn ? g.speed : 1.f;
+        if (sched->getTimeScale() != target) sched->setTimeScale(target);
+
         PlayLayer::update(dt);
 
-        if (cfg::get("autoclicker")) this->tickAutoclicker(dt);
+        if (g.clicker) this->tickAutoclicker(dt);
+        this->tickNoclipStats();
 
-        bool layout = cfg::get("layout");
-        if (layout != m_fields->prevLayout) {
-            m_fields->prevLayout = layout;
-            this->applyLayoutMode(layout);
+        // layout mode
+        if (g.layout != m_fields->prevLayout) {
+            m_fields->prevLayout = g.layout;
+            this->applyLayoutMode(g.layout);
+        }
+        if (g.layout) this->forceFlatColors();
+    }
+
+    void tickNoclipStats() {
+        auto f = m_fields.self();
+        if (!f->statsLabel) return;
+
+        bool show = g.noclip && g.counter;
+        f->statsLabel->setVisible(show);
+
+        if (g.noclip) {
+            f->totalFrames++;
+            if (f->hitThisFrame) {
+                f->deadFrames++;
+                if (!f->hitLastFrame) f->hits++; // new hit, not the same one continuing
+            }
+        }
+        f->hitLastFrame = f->hitThisFrame;
+        f->hitThisFrame = false;
+
+        if (show && ++f->labelTick >= 6) {
+            f->labelTick = 0;
+            float acc = f->totalFrames > 0
+                ? 100.f * (1.f - static_cast<float>(f->deadFrames) / f->totalFrames)
+                : 100.f;
+            f->statsLabel->setString(fmt::format("Hits: {}   Acc: {:.1f}%", f->hits, acc).c_str());
         }
     }
 
     void tickAutoclicker(float dt) {
-        if (m_player1 && m_player1->m_isDead) return;
+        if (!m_player1 || m_player1->m_isDead) return;
         auto f = m_fields.self();
+        float interval = 1.f / g.cps;
+        float hold = std::min(0.04f, interval * 0.5f);
 
         if (f->holding) {
             f->holdTimer -= dt;
@@ -280,10 +450,10 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
 
         f->clickTimer += dt;
-        if (f->clickTimer >= 1.f / cfg::CLICKS_PER_SECOND) {
+        if (f->clickTimer >= interval) {
             f->clickTimer = 0.f;
             f->holding = true;
-            f->holdTimer = cfg::HOLD_TIME;
+            f->holdTimer = hold;
             m_player1->pushButton(PlayerButton::Jump);
             if (m_gameState.m_isDualMode && m_player2) {
                 m_player2->pushButton(PlayerButton::Jump);
@@ -291,16 +461,32 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
     }
 
+    // ---- layout mode ----
     void applyLayoutMode(bool enable) {
         if (m_objects) {
             for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
                 if (obj && obj->m_objectType == GameObjectType::Decoration) {
+                    // our setVisible hook keeps them hidden while enabled;
+                    // when disabled, culling re-shows whatever is on screen
                     obj->setVisible(!enable);
                 }
             }
         }
-        if (m_background) {
-            m_background->setColor(enable ? ccColor3B{40, 62, 255} : ccColor3B{255, 255, 255});
+        if (!enable) {
+            if (m_background) m_background->setColor({255, 255, 255});
+            if (m_groundLayer) {
+                m_groundLayer->updateGround01Color({255, 255, 255});
+                m_groundLayer->updateGround02Color({255, 255, 255});
+            }
+        }
+    }
+
+    // color triggers would otherwise recolor the flat layout look
+    void forceFlatColors() {
+        if (m_background) m_background->setColor({40, 62, 255});
+        if (m_groundLayer) {
+            m_groundLayer->updateGround01Color({25, 40, 170});
+            m_groundLayer->updateGround02Color({25, 40, 170});
         }
     }
 };
