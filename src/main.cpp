@@ -65,7 +65,7 @@ namespace sim {
     inline int nSolid = 0, nHazard = 0, nPad = 0, nOrb = 0, nPortal = 0, nSlope = 0;
 
     constexpr float HALF = 15.f;
-    constexpr float HAZ_HALF = 14.f;
+    constexpr float HAZ_HALF = 12.f; // Tighter hitbox so it doesn't over-jump
     constexpr float ORB_HALF = 15.f; // Match player hitbox for easier pad/orb activation
     constexpr float TERMINAL = -15.f;
     constexpr int SUB = 2;
@@ -711,8 +711,8 @@ class $modify(BotPlayLayer, PlayLayer) {
                 if (!isSaw && r.size.width <= 30.f && r.size.height <= 30.f) {
                     float cx = r.origin.x + r.size.width * 0.5f;
                     float cy = r.origin.y + r.size.height * 0.5f;
-                    float w = std::min(r.size.width, 26.f);
-                    float h = std::min(r.size.height, 26.f);
+                    float w = std::min(r.size.width, 12.f);
+                    float h = std::min(r.size.height, 12.f);
                     r = CCRect(cx - w * 0.5f, cy - h * 0.5f, w, h);
                 }
             } else {
@@ -1214,7 +1214,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                     } else if (extra == 0 || (k & 1) == 0) {
                         auto j = w;
                         sim::step(j, vx, true);
-                        p.budget = extra == 0 ? 8000 : 15000;
+                        p.budget = extra == 0 ? 50000 : 15000;
                         if (!j.dead && p.survive(j, 1, extra)) {
                             if (runFirst < 0) runFirst = k;
                             if (bestFirst < 0 || (k - runFirst) >= (bestLast - bestFirst)) {
@@ -1229,8 +1229,8 @@ class $modify(BotPlayLayer, PlayLayer) {
                     if (w.dead) break;
                 }
                 if (bestFirst >= 0) {
-                    // Aim for the middle of the safe window
-                    int jumpFrame = bestFirst + (bestLast - bestFirst) / 2;
+                    // Jump early but not immediately (prevents jumping too early).
+                    int jumpFrame = bestFirst + std::min(2, (bestLast - bestFirst) / 2);
                     aimX = s.x + vx * jumpFrame;
                     lastX = s.x + vx * bestLast;
                     return true;
