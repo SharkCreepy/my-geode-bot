@@ -603,15 +603,10 @@ class $modify(BotPlayLayer, PlayLayer) {
         float planX = 0.f;
         float planDeadlineX = 0.f;
         int cooldown = 0;
-        int planAge = 0;
         int lockIdx = -1;
         int waveDir = 1;
         CCLabelBMFont* status = nullptr;
         std::string lastStatus;
-
-        float lastDeathX = -1e9f;
-        int   lastDeathJumpBit = 0;
-        float lastPressX = -1e9f;
     };
 
     bool isOnLocalGround(float x, float y, bool flip) {
@@ -802,12 +797,6 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
-        auto f = m_fields.self();
-        if (player) {
-            float px = player->getPositionX();
-            f->lastDeathX = px;
-            f->lastDeathJumpBit = (std::abs(f->lastPressX - px) < 60.f) ? 1 : 0;
-        }
         m_fields->haveLast = false;
         m_fields->vy = 0.f;
         PlayLayer::destroyPlayer(player, object);
@@ -821,7 +810,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->botRelease = 0;
         f->havePlan = false;
         f->cooldown = 0;
-        f->planAge = 0;
         f->lockIdx = -1;
         f->haveLast = false;
 
@@ -833,10 +821,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->trajPrevWaveDir = 1;
         f->trajPrevWasWave = false;
         f->lastRebuildX = -1e9f;
-
-        f->lastDeathX = -1e9f;
-        f->lastDeathJumpBit = 0;
-        f->lastPressX = -1e9f;
 
         if (f->rebuilds < 2) {
             f->rebuilds++;
@@ -963,8 +947,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         s.lock = -1;
 
         bool geomGround = this->isOnLocalGround(s.x, s.y, flip);
-        bool isMoving = std::abs(m_player1->m_yVelocity) > 2.0f;
-        s.ground = (geomGround || m_player1->m_isOnGround) && !isMoving;
+        s.ground = geomGround || m_player1->m_isOnGround;
 
         s.vy = s.ground ? 0.f : f->vy * up;
 
@@ -1162,7 +1145,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         } else {
             f->lockIdx = -1;
         }
-        f->lastPressX = s.x;
         f->havePlan = false;
         f->botHolding = true;
         f->botRelease = 2;
@@ -1225,10 +1207,10 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (d < 0) { f->havePlan = false; return; }
 
         if (f->havePlan) {
-            if (++f->planAge >= 4 || s.x > f->planDeadlineX) f->havePlan = false;
+            if (s.x > f->planDeadlineX) f->havePlan = false;
         }
         if (f->havePlan) {
-            if (act && (s.x + vx * 0.5f >= f->planX || d <= 2)) this->botPress(s);
+            if (act && s.x + vx * 0.5f >= f->planX) this->botPress(s);
             return;
         }
         if (f->cooldown > 0) return;
@@ -1268,8 +1250,6 @@ class $modify(BotPlayLayer, PlayLayer) {
                     if (w.dead) break;
                 }
                 if (bestFirst >= 0) {
-                    // Jump shortly after the earliest safe frame (max 2 frames delay).
-                    // This prevents falling off ledges while avoiding spam.
                     int jumpFrame = bestFirst + std::min(2, (bestLast - bestFirst) / 2);
                     aimX = s.x + vx * jumpFrame;
                     lastX = s.x + vx * bestLast;
@@ -1280,11 +1260,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         };
 
         float aimX = 0.f, lastX = 0.f;
-        bool nearDeath = std::abs(s.x - f->lastDeathX) < 50.f;
-        float margin = nearDeath ? 6.f : 3.f;
         
-        bool ok = findWindow(margin, aimX, lastX);
-        if (!ok) ok = findWindow(0.f, aimX, lastX);
+        bool ok = findWindow(0.f, aimX, lastX);
 
         if (!ok) {
             if (act && d <= 3) this->botPress(s, 6);
@@ -1299,7 +1276,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->havePlan = true;
         f->planX = aimX;
         f->planDeadlineX = lastX + vx * 0.5f;
-        f->planAge = 0;
         f->trajDirty = true;
     }
 
