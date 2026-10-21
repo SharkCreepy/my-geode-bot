@@ -216,7 +216,6 @@ namespace sim {
                     ly = by0 - HALF;
                     s.y = ly * up;
                     s.vy = 0.f;
-                    // Note: Hitting a ceiling does NOT kill you, it just stops your upward momentum
                 }
             });
             if (s.dead) break;
@@ -253,8 +252,6 @@ namespace sim {
                                     ? (right ? (b.y1 - Hh * t) : (b.y0 + Hh * t))
                                     : (right ? (b.y0 + Hh * t) : (b.y1 - Hh * t));
                                 
-                                // Fix: Only snap to the slope surface if we are landing on it from above.
-                                // Hitting a slope from the side or bottom should result in death.
                                 if (!s.flip) {
                                     if (s.y + HALF < surfY - 5.f) { 
                                         s.dead = true; 
@@ -335,7 +332,7 @@ namespace sim {
 
             while (f < H) {
                 if (--budget <= 0) return false;
-                if (pressesLeft > 0 && (f & 1) == 0 && nc < 64 && canAct(t)) {
+                if (pressesLeft > 0 && nc < 64 && canAct(t)) {
                     cands[nc++] = {f, t};
                 }
                 step(t, vx, false);
@@ -1232,9 +1229,8 @@ class $modify(BotPlayLayer, PlayLayer) {
                     if (w.dead) break;
                 }
                 if (bestFirst >= 0) {
-                    // Aim for the last possible safe frame (or close to it).
-                    // Jumping late prevents the bot from hitting ceilings or jumping unnecessarily early.
-                    int jumpFrame = std::max(bestFirst, bestLast - 1);
+                    // Aim for the absolute last possible frame to jump
+                    int jumpFrame = bestLast;
                     aimX = s.x + vx * jumpFrame;
                     lastX = s.x + vx * bestLast;
                     return true;
@@ -1248,7 +1244,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool ok = findWindow(0.f, aimX, lastX);
 
         if (!ok) {
-            // If no safe jump is found but we are about to die, panic jump
             if (act && d >= 0 && d <= 2) this->botPress(s, 6);
             return;
         }
