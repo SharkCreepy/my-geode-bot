@@ -10,8 +10,8 @@ bool g_noclipEnabled = false;
 bool g_autoClickerEnabled = false;
 bool g_layoutModeEnabled = false;
 
-// --- Custom Draggable Button (Geode v5 API) ---
-class DraggableButton : public CCNode {
+// --- Custom Draggable Button (Uses CCTargetedTouchDelegate) ---
+class DraggableButton : public CCNode, public cocos2d::CCTargetedTouchDelegate {
 protected:
     bool m_isDragging = false;
     CCPoint m_startPos;
@@ -22,54 +22,61 @@ public:
     bool init(CCNode* normalSprite, CCObject* target, SEL_MenuHandler selector) {
         if (!CCNode::init()) return false;
 
+        // Create the visual button
         m_button = CCMenuItemSpriteExtra::create(normalSprite, nullptr, target, selector);
         m_button->setPosition({0, 0});
         this->addChild(m_button);
 
-        // Use the cocos2d namespace for the touch listener
-        auto listener = cocos2d::EventListenerTouchOneByOne::create();
-        listener->setSwallowTouches(true);
-
-        listener->onTouchBegan = [this](CCTouch* touch, CCEvent* event) {
-            auto location = touch->getLocation();
-            auto local = this->convertToNodeSpace(location);
-            auto size = this->getContentSize();
-            if (local.x >= 0 && local.x <= size.width && local.y >= 0 && local.y <= size.height) {
-                m_startPos = this->getPosition();
-                m_startTouch = location;
-                m_isDragging = false;
-                return true;
-            }
-            return false;
-        };
-
-        listener->onTouchMoved = [this](CCTouch* touch, CCEvent* event) {
-            auto location = touch->getLocation();
-            auto diff = location - m_startTouch;
-            if (std::abs(diff.x) > 5.f || std::abs(diff.y) > 5.f) {
-                m_isDragging = true;
-            }
-            if (m_isDragging) {
-                auto newPos = m_startPos + diff;
-                auto winSize = CCDirector::sharedDirector()->getWinSize();
-                newPos.x = std::clamp(newPos.x, 25.f, winSize.width - 25.f);
-                newPos.y = std::clamp(newPos.y, 25.f, winSize.height - 25.f);
-                this->setPosition(newPos);
-            }
-        };
-
-        listener->onTouchEnded = [this](CCTouch* touch, CCEvent* event) {
-            if (m_isDragging) {
-                m_isDragging = false;
-            } else {
-                m_button->activate();
-            }
-        };
-
-        // Register with the global touch dispatcher
-        cocos2d::CCTouchDispatcher::get()->addTargetedDelegate(listener, 0, true);
+        // Register this node to handle touches
+        CCTouchDispatcher::get()->addTargetedDelegate(this, 0, true);
 
         return true;
+    }
+
+    void onExit() {
+        // Clean up the touch delegate when the button is removed
+        CCTouchDispatcher::get()->removeDelegate(this);
+        CCNode::onExit();
+    }
+
+    bool ccTouchBegan(CCTouch* touch, CCEvent* event) override {
+        auto location = touch->getLocation();
+        auto local = this->convertToNodeSpace(location);
+        auto size = this->getContentSize();
+        if (local.x >= 0 && local.x <= size.width && local.y >= 0 && local.y <= size.height) {
+            m_startPos = this->getPosition();
+            m_startTouch = location;
+            m_isDragging = false;
+            return true;
+        }
+        return false;
+    }
+
+    void ccTouchMoved(CCTouch* touch, CCEvent* event) override {
+        auto location = touch->getLocation();
+        auto diff = location - m_startTouch;
+        if (std::abs(diff.x) > 5.f || std::abs(diff.y) > 5.f) {
+            m_isDragging = true;
+        }
+        if (m_isDragging) {
+            auto newPos = m_startPos + diff;
+            auto winSize = CCDirector::sharedDirector()->getWinSize();
+            newPos.x = std::clamp(newPos.x, 25.f, winSize.width - 25.f);
+            newPos.y = std::clamp(newPos.y, 25.f, winSize.height - 25.f);
+            this->setPosition(newPos);
+        }
+    }
+
+    void ccTouchEnded(CCTouch* touch, CCEvent* event) override {
+        if (m_isDragging) {
+            m_isDragging = false;
+        } else {
+            m_button->activate(); // Trigger the click if not dragged
+        }
+    }
+
+    void ccTouchCancelled(CCTouch* touch, CCEvent* event) override {
+        m_isDragging = false;
     }
 
     static DraggableButton* create(CCNode* normalSprite, CCObject* target, SEL_MenuHandler selector) {
@@ -167,6 +174,7 @@ class $modify(MyPlayLayer, PlayLayer) {
         auto winSize = CCDirector::sharedDirector()->getWinSize();
         menuBtn->setPosition({40.f, winSize.height - 40.f});
         
+        // Z-order 9999 ensures it renders above all other UI elements
         this->addChild(menuBtn, 9999); 
 
         return true;
@@ -176,6 +184,7 @@ class $modify(MyPlayLayer, PlayLayer) {
         MyBotMenu::create()->show();
     }
 
+    // --- Noclip Logic ---
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         if (g_noclipEnabled) {
             return; 
@@ -186,11 +195,13 @@ class $modify(MyPlayLayer, PlayLayer) {
     void update(float dt) {
         PlayLayer::update(dt);
 
+        // --- Autoclicker Logic ---
         if (g_autoClickerEnabled && m_player1) {
             m_player1->pushButton(PlayerButton::Jump);
             m_player1->releaseButton(PlayerButton::Jump);
         }
 
+        // --- Layout Mode Logic ---
         if (g_layoutModeEnabled != m_fields->m_prevLayoutMode) {
             m_fields->m_prevLayoutMode = g_layoutModeEnabled;
             applyLayoutMode(g_layoutModeEnabled);
@@ -198,6 +209,7 @@ class $modify(MyPlayLayer, PlayLayer) {
     }
 
     void applyLayoutMode(bool enable) {
+        // 1. Hide/Show Decoration Objects
         if (m_objects) {
             for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
                 if (obj->m_objectType == GameObjectType::Decoration) {
@@ -206,6 +218,7 @@ class $modify(MyPlayLayer, PlayLayer) {
             }
         }
 
+        // 2. Change Background Color
         if (m_background) {
             if (enable) {
                 m_background->setColor({40, 62, 255}); 
