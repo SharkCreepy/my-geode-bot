@@ -1422,3 +1422,4 @@ class $modify(StepPlayer, PlayerObject) {
         PlayerObject::update(dt);
     }
 };
+
