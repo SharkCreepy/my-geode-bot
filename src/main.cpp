@@ -25,7 +25,6 @@ constexpr float DEFAULT_HUD_SCALE = 1.0f;
 constexpr bool SHOW_SIM_BOXES = true;
 // Which corner holds the right angle on an unrotated, unflipped slope:
 // 0 = bottom-left, 1 = bottom-right, 2 = top-left, 3 = top-right.
-// If the yellow debug triangles look mirrored, change this.
 constexpr int SLOPE_BASE_CORNER = 1;
 
 struct State {
@@ -111,7 +110,7 @@ namespace sim {
     inline int nSolid = 0, nHazard = 0, nPad = 0, nOrb = 0, nPortal = 0, nSlope = 0;
 
     constexpr float HALF = 15.f;
-    constexpr float HAZ_HALF = 11.f;
+    constexpr float HAZ_HALF = 13.f; // Increased from 11
     constexpr float ORB_HALF = 12.f;
     constexpr float TERMINAL = -15.f;
     constexpr int SUB = 2;
@@ -167,7 +166,7 @@ namespace sim {
         if (b.circular) {
             float cx = (b.x0 + b.x1) * 0.5f;
             float cy = (b.y0 + b.y1) * 0.5f;
-            float r = std::min(b.x1 - b.x0, b.y1 - b.y0) * 0.42f + margin;
+            float r = std::min(b.x1 - b.x0, b.y1 - b.y0) * 0.45f + margin;
             return circleOverlapBox(x, y, half_, cx, cy, r);
         }
         return overlap(x, y, half_ + margin, b);
@@ -300,7 +299,7 @@ namespace sim {
                                 
                                 if (!s.flip) {
                                     if (s.y - HALF < surfY - 2.f) {
-                                        s.dead = true; // Hit from below
+                                        s.dead = true; 
                                     } else {
                                         s.y = surfY + HALF;
                                         if (s.vy < 0.f) s.vy = 0.f;
@@ -316,7 +315,7 @@ namespace sim {
                                     }
                                 }
                             } else {
-                                s.dead = true;
+                                s.dead = true; 
                             }
                         }
                         break;
@@ -401,10 +400,10 @@ namespace sim {
 // Wave physics (hold = up, release = down; flipped gravity inverts)
 // ===============================================================
 namespace waveSim {
-    constexpr float HALF = 4.f;       // Tighter hitbox
-    constexpr float HAZ_HALF = 4.f;   // Tighter hazard check
-    constexpr int SUB = 4;            // Finer sub-steps
-    constexpr int MAXH = 80;          // More lookahead
+    constexpr float HALF = 4.f;       
+    constexpr float HAZ_HALF = 4.f;   
+    constexpr int SUB = 4;            
+    constexpr int MAXH = 80;          
 
     struct S {
         float x = 0.f, y = 0.f;
@@ -968,11 +967,6 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     void buildGeometry() {
-        std::unordered_map<GameObject*, std::pair<float,float>> oldPos;
-        for (auto const& b : sim::boxes) {
-            if (b.src) oldPos[b.src] = {b.x0, b.y0};
-        }
-
         sim::boxes.clear();
         sim::wide.clear();
         sim::maxW = 30.f;
@@ -1027,8 +1021,8 @@ class $modify(BotPlayLayer, PlayLayer) {
                 if (!isSaw && r.size.width <= 30.f && r.size.height <= 30.f) {
                     float cx = r.origin.x + r.size.width * 0.5f;
                     float cy = r.origin.y + r.size.height * 0.5f;
-                    float w = std::min(r.size.width, 15.f);
-                    float h = std::min(r.size.height, 15.f);
+                    float w = std::min(r.size.width, 26.f); // Increased from 15.f
+                    float h = std::min(r.size.height, 26.f);
                     r = CCRect(cx - w * 0.5f, cy - h * 0.5f, w, h);
                 }
             } else {
@@ -1047,19 +1041,6 @@ class $modify(BotPlayLayer, PlayLayer) {
                 }
             }
             if (r.size.width <= 0.f || r.size.height <= 0.f) continue;
-
-            bool isDynamic = false;
-            auto oit = oldPos.find(obj);
-            if (oit != oldPos.end()) {
-                if (std::abs(oit->second.first  - r.origin.x) > 2.0f ||
-                    std::abs(oit->second.second - r.origin.y) > 2.0f) {
-                    isDynamic = true;
-                }
-            }
-            // Do NOT skip hazards. Only skip moving solids.
-            if (isDynamic && kind == sim::Solid) {
-                continue;
-            }
 
             sim::Box b{r.origin.x, r.origin.y, r.origin.x + r.size.width,
                        r.origin.y + r.size.height, kind, obj};
@@ -1592,10 +1573,9 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         int H = std::min(sim::horizon(f->vx), waveSim::MAXH);
         int mask = waveSim::plan(s, f->vx, H);
-        if (mask == 0) return; // no survivable line, keep doing what we're doing
+        if (mask == 0) return; 
 
         bool cur = f->botHolding;
-        // keep the current input if it's safe, otherwise switch
         bool want = (mask & (cur ? 2 : 1)) ? cur : !cur;
         if (want != cur) {
             f->botHolding = want;
@@ -1634,7 +1614,8 @@ class $modify(BotPlayLayer, PlayLayer) {
             if (++f->planAge >= 4 || s.x > f->planDeadlineX) f->havePlan = false;
         }
         if (f->havePlan) {
-            if (act && (s.x + vx * 0.5f >= f->planX || d <= 1)) this->botPress(s);
+            // Jump as early as possible to avoid being late
+            if (act && (s.x + vx * 0.5f >= f->planX || d <= 2)) this->botPress(s);
             return;
         }
         if (f->cooldown > 0) return;
@@ -1674,7 +1655,8 @@ class $modify(BotPlayLayer, PlayLayer) {
                     if (w.dead) break;
                 }
                 if (bestFirst >= 0) {
-                    aimX = s.x + vx * (bestFirst + (bestLast - bestFirst) * 0.5f);
+                    // Aim for the start of the safe window, not the middle
+                    aimX = s.x + vx * bestFirst;
                     lastX = s.x + vx * bestLast;
                     return true;
                 }
