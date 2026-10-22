@@ -799,6 +799,12 @@ static int slopeCorner(GameObject* obj) {
     return cx | (cy << 1);
 }
 
+// Marker types:
+//   0 = death the sim predicted (red X)
+//   1 = bot had no safe plan / was forced to guess (orange X)
+//   2 = death the sim did NOT predict, likely a physics or hitbox error (magenta X)
+struct Marker { float x, y; int type; };
+
 class $modify(BotPlayLayer, PlayLayer) {
     struct Fields {
         bool prevLayout = false;
@@ -853,6 +859,25 @@ class $modify(BotPlayLayer, PlayLayer) {
         int planIdle = 0;
         int cooldown = 0;
         int planAge = 0;
+        std::vector<Marker> markers;
+        CCDrawNode* markerNode = nullptr;
+        bool lastPredDeath = false;
+
+        // Replay: press/toggle x positions of this attempt and the best attempt so far
+        std::vector<float> curPresses, bestPresses;
+        float maxX = -1e9f, bestX = -1e9f;
+        size_t replayIdx = 0;
+        bool replayActive = false;
+
+        // Learned hazard margin: grows each time the sim misses a death
+        float learnedMargin = 0.f;
+
+        // Calibration of jump velocity and gravity from real play
+        bool calibHave = false;
+        bool calibJumpPending = false;
+        float calibPrevVy = 0.f;
+        float calibGrav = 0.958199f;
+        float calibJump = 11.180032f;
         int retry = 0;
         int lockIdx = -1;
         int waveDir = 1;
@@ -931,6 +956,11 @@ class $modify(BotPlayLayer, PlayLayer) {
             auto node = CCDrawNode::create();
             m_objectLayer->addChild(node, 1000);
             m_fields->traj = node;
+        }
+        if (m_objectLayer) {
+            auto mn = CCDrawNode::create();
+            m_objectLayer->addChild(mn, 1001);
+            m_fields->markerNode = mn;
         }
 
         auto status = CCLabelBMFont::create("", "bigFont.fnt");
@@ -1078,6 +1108,15 @@ class $modify(BotPlayLayer, PlayLayer) {
             m_fields->hitFlag = true;
             return;
         }
+        if (player == m_player1) {
+            int t = m_fields->lastPredDeath ? 0 : 2;
+            this->addMarker(player->getPositionX(), player->getPositionY(), t);
+            if (t == 2) m_fields->learnedMargin = std::min(m_fields->learnedMargin + 0.5f, 8.f);
+            if (m_fields->maxX > m_fields->bestX) {
+                m_fields->bestX = m_fields->maxX;
+                m_fields->bestPresses = m_fields->curPresses;
+            }
+        }
         m_fields->haveLast = false;
         m_fields->vy = 0.f;
         PlayLayer::destroyPlayer(player, object);
@@ -1097,6 +1136,14 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->cooldown = 0;
         f->retry = 0;
         f->planAge = 0;
+        f->markers.clear();
+        f->lastPredDeath = false;
+        f->curPresses.clear();
+        f->maxX = -1e9f;
+        f->replayIdx = 0;
+        f->replayActive = !f->bestPresses.empty();
+        f->calibHave = false;
+        f->calibJumpPending = false;
         f->lockIdx = -1;
         f->deaths = 0;
         f->totalSteps = 0;
@@ -1144,6 +1191,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         this->updateHud();
         this->tickNoclipStats();
         this->measure(dt);
+        if (m_player1 && !m_player1->m_isDead) f->maxX = std::max(f->maxX, m_player1->getPositionX());
+        this->calibrate();
 
         if (!g.clicker && f->holding) { f->holding = false; this->pressJump(false); }
         if (!g.bot && f->botHolding) { f->botHolding = false; f->botRelease = 0; this->pressJump(false); }
@@ -1151,7 +1200,21 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (g.bot) this->tickBot();
         else if (g.clicker) this->tickAutoclicker(dt);
 
+        if (!g.bot && m_player1) {
+            if (this->cubeMode()) {
+                f->lastPredDeath = sim::deathFrame(this->currentSimState(), f->vx,
+                                                   sim::horizon(f->vx)) >= 0;
+            } else if (this->waveMode()) {
+                waveSim::S ws;
+                ws.x = m_player1->getPositionX();
+                ws.y = m_player1->getPositionY();
+                ws.flip = m_player1->m_isUpsideDown;
+                ws.hold = f->botHolding;
+                f->lastPredDeath = waveSim::plan(ws, f->vx, std::min(sim::horizon(f->vx), waveSim::MAXH)) == 0;
+            }
+        }
         this->drawTrajectory();
+        this->drawMarkers();
         this->updateStatus();
 
         if (g.layout != f->prevLayout) {
@@ -1408,6 +1471,59 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
     }
 
+    void addMarker(float x, float y, int type) {
+        auto f = m_fields.self();
+        for (auto const& m : f->markers) {
+            if (m.type == type && std::abs(m.x - x) < 12.f && std::abs(m.y - y) < 12.f) return;
+        }
+        if (f->markers.size() < 500) f->markers.push_back({x, y, type});
+    }
+
+    // Measures the real jump velocity and gravity from play and feeds them into the sim.
+    // Gravity comes from free-fall frames (vy drops by about grav per frame).
+    // Jump velocity comes from the first frame after a ground press (vy + grav ~ jumpVel).
+    void calibrate() {
+        auto f = m_fields.self();
+        if (!m_player1 || !this->cubeMode() || m_player1->m_isUpsideDown) {
+            f->calibHave = false;
+            f->calibJumpPending = false;
+            return;
+        }
+        bool ground = m_player1->m_isOnGround;
+        float vy = f->vy;
+        if (f->calibHave) {
+            if (f->calibJumpPending) {
+                float jv = vy + f->calibGrav;
+                if (jv > 8.f && jv < 14.f) f->calibJump += 0.05f * (jv - f->calibJump);
+                f->calibJumpPending = false;
+            } else if (!ground) {
+                float dv = vy - f->calibPrevVy;
+                // Only plain free-fall frames: orb/pad launches show up as large positive dv
+                if (dv < -0.5f && dv > -1.5f) f->calibGrav += 0.02f * (-dv - f->calibGrav);
+            }
+            f->calibJump = std::clamp(f->calibJump, 9.5f, 13.f);
+            f->calibGrav = std::clamp(f->calibGrav, 0.6f, 1.3f);
+            sim::jumpVel = f->calibJump;
+            sim::grav = f->calibGrav;
+        }
+        f->calibPrevVy = vy;
+        f->calibHave = true;
+    }
+
+    void drawMarkers() {
+        auto f = m_fields.self();
+        if (!f->markerNode) return;
+        f->markerNode->clear();
+        for (auto const& m : f->markers) {
+            ccColor4F c = m.type == 0 ? ccc4f(1.f, 0.15f, 0.15f, 1.f)
+                        : m.type == 1 ? ccc4f(1.f, 0.6f, 0.1f, 1.f)
+                                      : ccc4f(1.f, 0.2f, 1.f, 1.f);
+            float r = 8.f;
+            f->markerNode->drawSegment({m.x - r, m.y - r}, {m.x + r, m.y + r}, 2.f, c);
+            f->markerNode->drawSegment({m.x - r, m.y + r}, {m.x + r, m.y - r}, 2.f, c);
+        }
+    }
+
     void drawSimBoxes() {
         auto f = m_fields.self();
         if (!m_player1) return;
@@ -1491,6 +1607,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->botRelease = 2;
         f->cooldown = cooldown;
         f->trajDirty = true;
+        f->curPresses.push_back(s.x);
+        f->calibJumpPending = s.ground;
         this->pressJump(true);
     }
 
@@ -1557,7 +1675,31 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         int H = std::min(sim::horizon(f->vx), waveSim::MAXH);
         int mask = waveSim::plan(s, f->vx, H);
-        if (mask == 0) return; // nothing survives, keep current input
+        f->lastPredDeath = (mask == 0);
+        if (mask == 0) {
+            this->addMarker(s.x, s.y, 1);
+            return; // nothing survives, keep current input
+        }
+
+        // Follow the best previous attempt's toggles while they still line up
+        if (f->replayActive) {
+            if (f->replayIdx >= f->bestPresses.size()) {
+                f->replayActive = false;
+            } else {
+                float rx = f->bestPresses[f->replayIdx];
+                if (s.x > rx + 4.f * f->vx) {
+                    f->replayActive = false;
+                } else {
+                    if (s.x >= rx) {
+                        f->botHolding = !f->botHolding;
+                        f->curPresses.push_back(s.x);
+                        this->pressJump(f->botHolding);
+                        f->replayIdx++;
+                    }
+                    return;
+                }
+            }
+        }
 
         bool cur = f->botHolding;
         // Keep the current input if it's still safe, otherwise switch.
@@ -1565,6 +1707,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool want = keepSafe ? cur : !cur;
         if (want != cur) {
             f->botHolding = want;
+            f->curPresses.push_back(s.x);
             this->pressJump(want);
         }
     }
@@ -1595,6 +1738,25 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool act = sim::canAct(s);
 
         int d = sim::deathFrame(s, vx, H);
+        f->lastPredDeath = d >= 0;
+
+        // Follow the best previous attempt's presses while they still line up with the sim
+        if (f->replayActive) {
+            if (f->replayIdx >= f->bestPresses.size()) {
+                f->replayActive = false;
+            } else {
+                float rx = f->bestPresses[f->replayIdx];
+                if (s.x > rx + 4.f * vx || (d >= 0 && d <= 2)) {
+                    f->replayActive = false; // drifted or about to die: planner takes over
+                } else {
+                    if (act && s.x + vx * 0.5f >= rx) {
+                        this->botPress(s);
+                        f->replayIdx++;
+                    }
+                    return;
+                }
+            }
+        }
         if (d < 0) { f->havePlan = false; return; } // nothing to avoid
 
         // Re-plan every few ticks so a bad velocity estimate can't hold a stale plan forever
@@ -1654,9 +1816,12 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         float aimX = 0.f, lastX = 0.f;
         // First try with extra clearance around hazards, then fall back to exact hitboxes
-        bool ok = findWindow(3.f, aimX, lastX) || findWindow(0.f, aimX, lastX);
+        bool ok = findWindow(f->learnedMargin + 3.f, aimX, lastX)
+               || findWindow(f->learnedMargin, aimX, lastX)
+               || findWindow(0.f, aimX, lastX);
 
         if (!ok) {
+            this->addMarker(s.x, s.y, 1);
             if (act && d <= 3) this->botPress(s, 6); // last-ditch jump
             return;
         }
