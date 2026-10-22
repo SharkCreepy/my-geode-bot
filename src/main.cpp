@@ -204,9 +204,7 @@ namespace sim {
                     s.vy = 0.f;
                     s.ground = true;
                 } else if (s.vy > 0.f && prevTop <= by0 + 1.f) {
-                    ly = by0 - HALF;
-                    s.y = ly * up;
-                    s.vy = 0.f;
+                    s.dead = true; // hit the underside of a block
                 }
             });
             if (s.dead) break;
@@ -740,6 +738,8 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         bool stepHookSeen = false;
         CCLabelBMFont* cpsLabel = nullptr;
+        CCLabelBMFont* warnLabel = nullptr;
+        int predDeathIn = -1;
 
         bool haveLast = false;
         float lastX = 0.f, lastY = 0.f;
@@ -857,6 +857,14 @@ class $modify(BotPlayLayer, PlayLayer) {
         cps->setVisible(g.cpsCounter);
         ui->addChild(cps, 999);
         m_fields->cpsLabel = cps;
+
+        auto warn = CCLabelBMFont::create("", "bigFont.fnt");
+        warn->setScale(0.45f);
+        warn->setColor(ccColor3B{255, 60, 60});
+        warn->setPosition({win.width / 2.f, win.height - 110.f});
+        warn->setVisible(false);
+        ui->addChild(warn, 999);
+        m_fields->warnLabel = warn;
 
         auto status = CCLabelBMFont::create("", "bigFont.fnt");
         status->setScale(0.35f);
@@ -1076,6 +1084,11 @@ class $modify(BotPlayLayer, PlayLayer) {
         g.clock += dt;
         this->measure(dt);
         this->updateCps();
+        f->predDeathIn = -1;
+        if (m_player1 && this->cubeMode()) {
+            f->predDeathIn = sim::deathFrame(this->currentSimState(), f->vx, sim::horizon(f->vx));
+        }
+        this->updateWarning();
         if (m_player1 && !m_player1->m_isDead) f->maxX = std::max(f->maxX, m_player1->getPositionX());
         this->calibrate();
 
@@ -1119,6 +1132,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         std::string msg;
         if (!m_player1) msg = "no player";
+        else if (m_player1->m_isDead) msg = "Dead, retrying";
         else if (this->waveMode()) msg = fmt::format("Wave | S{} H{} L{} | {} v3", sim::nSolid, sim::nHazard, sim::nSlope, g.bot ? "bot" : "traj");
         else if (!this->cubeMode()) msg = "Unsupported gamemode (cube + wave only)";
         else if (sim::boxes.empty() && sim::wide.empty()) msg = "No level geometry found";
@@ -1136,6 +1150,18 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto f = m_fields.self();
         f->stepHookSeen = true;
         f->stepsThisTick++;
+    }
+
+    // Shows a red warning when the sim predicts a hit within about half a second
+    void updateWarning() {
+        auto f = m_fields.self();
+        if (!f->warnLabel) return;
+        bool show = (g.bot || g.trajectory) && m_player1 && !m_player1->m_isDead &&
+                    f->predDeathIn >= 0 && f->predDeathIn <= 30;
+        f->warnLabel->setVisible(show);
+        if (show) {
+            f->warnLabel->setString(fmt::format("WARNING: hit in {} frames", f->predDeathIn).c_str());
+        }
     }
 
     void updateCps() {
@@ -1648,6 +1674,15 @@ class $modify(BotPlayLayer, PlayLayer) {
                || findWindow(0.f, aimX, lastX);
 
         if (!ok) {
+            // Far-away deaths are not urgent: keep waiting instead of jumping early
+            if (d > 30) return;
+            // Pads launch the cube by themselves, so don't add a jump on top of one
+            bool onPad = false;
+            sim::forEachNear(s.x, [&](sim::Box const& b) {
+                if (sim::isPad(b.kind) && sim::overlap(s.x, s.y, sim::ORB_HALF, b)) onPad = true;
+            });
+            if (onPad) return;
+
             this->addMarker(s.x, s.y, 1);
             // No jump clears everything in the look-ahead. Instead of waiting until death is
             // imminent, take the press frame that survives longest (better than doing nothing).
@@ -1659,7 +1694,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                     sim::step(j, vx, true);
                     int depth = j.dead ? 0 : sim::deathFrame(j, vx, H);
                     if (depth < 0) depth = H; // survives the whole horizon
-                    if (depth > bestDepth) { bestDepth = depth; bestK = k; }
+                    if (depth > bestDepth || (bestK >= 0 && depth == bestDepth)) { bestDepth = depth; bestK = k; }
                 }
                 sim::step(w, vx, false);
                 if (w.dead) break;
