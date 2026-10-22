@@ -26,8 +26,9 @@ constexpr int SLOPE_BASE_CORNER = 1;
 constexpr bool ENABLE_CALIBRATION = false;
 // Upper limit for the learned hazard margin (in level units).
 constexpr float MAX_LEARNED_MARGIN = 2.f;
-// Replay the best earlier attempt's presses. Off: it made every retry copy the same path.
-constexpr bool ENABLE_REPLAY = false;
+// Replay the best earlier attempt's presses. Stops only just before a known death,
+// lets the planner fix that spot, then resumes the rest of the recorded path.
+constexpr bool ENABLE_REPLAY = true;
 
 struct State {
     bool layout = false;
@@ -771,6 +772,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         float planX = 0.f;
         float planDeadlineX = 0.f;
         float planFirstX = 0.f;
+        float replayResumeX = -1e9f;
         int planIdle = 0;
         int cooldown = 0;
         int planAge = 0;
@@ -1042,6 +1044,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->maxX = -1e9f;
         f->replayIdx = 0;
         f->replayActive = ENABLE_REPLAY && !f->bestPresses.empty();
+        f->replayResumeX = -1e9f;
         f->calibHave = false;
         f->calibJumpPending = false;
         f->lockIdx = -1;
@@ -1295,7 +1298,7 @@ class $modify(BotPlayLayer, PlayLayer) {
             f->trajPrevVY = f->vy;
         }
 
-        if (!stateChanged && !f->trajDirty && f->trajCounter < 2) return;
+        if (!g.bot && !stateChanged && !f->trajDirty && f->trajCounter < 2) return;
 
         f->trajCounter = 0;
         f->trajDirty = false;
@@ -1316,6 +1319,15 @@ class $modify(BotPlayLayer, PlayLayer) {
             if (x >= dx - 100.f && x <= dx + 5.f) return true;
         }
         return false;
+    }
+
+    // Smallest known death x in [x, x + 100], or -1e9 if none
+    float nextDeathAhead(float x) {
+        float best = -1e9f;
+        for (float dx : m_fields.self()->deathXs) {
+            if (dx >= x && dx <= x + 100.f && (best < -1e8f || dx < best)) best = dx;
+        }
+        return best;
     }
 
     void addMarker(float x, float y, int type) {
@@ -1436,11 +1448,47 @@ class $modify(BotPlayLayer, PlayLayer) {
         drawPath(false, -1, ccc4f(1.f, 0.4f, 0.4f, 0.9f));
         if (sim::canAct(start)) drawPath(true, -1, ccc4f(0.3f, 1.f, 0.4f, 0.9f));
 
+        auto drawPresses = [&](std::vector<int> const& presses, ccColor4F col) {
+            auto q = start;
+            auto prev = CCPoint{q.x, q.y};
+            CCPoint end = prev;
+            bool died = false;
+            for (int i = 0; i < H; i++) {
+                bool fire = std::find(presses.begin(), presses.end(), i) != presses.end();
+                sim::step(q, f->vx, fire);
+                CCPoint p{q.x, q.y};
+                if ((i % 2) == 0 || q.dead) {
+                    f->traj->drawSegment(prev, p, 1.4f, col);
+                    prev = p;
+                }
+                end = p;
+                if (q.dead) { died = true; break; }
+            }
+            f->traj->drawDot(end, 5.f,
+                died ? ccc4f(1.f, 0.2f, 0.2f, 1.f)
+                     : ccc4f(col.r, col.g, col.b, 0.85f));
+        };
+
         if (g.bot && f->havePlan) {
             int planFrame = static_cast<int>(std::round((f->planX - start.x) / f->vx));
             if (planFrame >= 0) {
                 planFrame = std::min(planFrame, H - 1);
-                drawPath(false, planFrame, ccc4f(0.35f, 0.65f, 1.f, 0.9f));
+                // Second press: the first later frame where pressing keeps the path alive
+                std::vector<int> presses{planFrame};
+                auto w = start;
+                for (int i = 0; i < H; i++) {
+                    if (i > planFrame && sim::canAct(w)) {
+                        auto j = w;
+                        sim::step(j, f->vx, true);
+                        if (!j.dead && sim::deathFrame(j, f->vx, H - i - 1) < 0) {
+                            presses.push_back(i);
+                            break;
+                        }
+                    }
+                    sim::step(w, f->vx, i == planFrame);
+                    if (w.dead) break;
+                }
+                drawPresses(presses, ccc4f(0.35f, 0.65f, 1.f, 0.9f));
                 f->traj->drawDot(CCPoint{start.x + f->vx * planFrame, start.y},
                                  6.f, ccc4f(0.35f, 0.65f, 1.f, 1.f));
             }
@@ -1604,14 +1652,20 @@ class $modify(BotPlayLayer, PlayLayer) {
         int d = sim::deathFrame(s, vx, H);
         f->lastPredDeath = d >= 0;
 
-        // Follow the best previous attempt's presses while they still line up with the sim
+        // Follow the best previous attempt's presses. Stop just before a known death,
+        // let the planner fix that spot, then resume the recorded path after it.
         if (f->replayActive) {
             if (f->replayIdx >= f->bestPresses.size()) {
                 f->replayActive = false;
             } else {
                 float rx = f->bestPresses[f->replayIdx];
-                if (s.x > rx + 4.f * vx || (d >= 0 && d <= 2)) {
-                    f->replayActive = false; // drifted or about to die: planner takes over
+                float dx = this->nextDeathAhead(rx);
+                if (dx > -1e8f) {
+                    f->replayActive = false;
+                    f->replayResumeX = dx + 30.f;
+                } else if (s.x > rx + 4.f * vx || (d >= 0 && d <= 2)) {
+                    f->replayActive = false;
+                    f->replayResumeX = s.x + 60.f;
                 } else {
                     if (act && s.x + vx * 0.5f >= rx) {
                         this->botPress(s);
@@ -1620,6 +1674,14 @@ class $modify(BotPlayLayer, PlayLayer) {
                     return;
                 }
             }
+        }
+        // Resume the recorded path once we are past the fixed spot
+        if (!f->replayActive && ENABLE_REPLAY && f->replayResumeX > -1e8f && s.x > f->replayResumeX) {
+            f->replayResumeX = -1e9f;
+            size_t i = 0;
+            while (i < f->bestPresses.size() && f->bestPresses[i] <= s.x) i++;
+            f->replayIdx = i;
+            f->replayActive = i < f->bestPresses.size();
         }
         if (d < 0 && !f->havePlan) return; // nothing to avoid, and no plan to keep
 
