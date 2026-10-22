@@ -1022,6 +1022,18 @@ class $modify(BotPlayLayer, PlayLayer) {
                 m_fields->bestX = m_fields->maxX;
                 m_fields->bestPresses = m_fields->curPresses;
             }
+            // Remove the press that led into this death from the recorded path (only that one),
+            // so replay doesn't repeat it and the planner must find another jump there.
+            {
+                float dx = player->getPositionX();
+                auto& bp = m_fields->bestPresses;
+                for (size_t i = bp.size(); i-- > 0;) {
+                    if (bp[i] <= dx + 5.f && bp[i] >= dx - 100.f) {
+                        bp.erase(bp.begin() + i);
+                        break;
+                    }
+                }
+            }
         }
         m_fields->haveLast = false;
         PlayLayer::destroyPlayer(player, object);
@@ -1321,6 +1333,14 @@ class $modify(BotPlayLayer, PlayLayer) {
         return false;
     }
 
+    // True if an earlier attempt died within `range` units ahead of x
+    bool deathAhead(float x, float range) {
+        for (float dx : m_fields.self()->deathXs) {
+            if (dx >= x && dx <= x + range) return true;
+        }
+        return false;
+    }
+
     // Smallest known death x in [x, x + 100], or -1e9 if none
     float nextDeathAhead(float x) {
         float best = -1e9f;
@@ -1448,12 +1468,14 @@ class $modify(BotPlayLayer, PlayLayer) {
         drawPath(false, -1, ccc4f(1.f, 0.4f, 0.4f, 0.9f));
         if (sim::canAct(start)) drawPath(true, -1, ccc4f(0.3f, 1.f, 0.4f, 0.9f));
 
+        int HP = std::max(H, 150); // preview far enough ahead to show the next obstacle
+
         auto drawPresses = [&](std::vector<int> const& presses, ccColor4F col) {
             auto q = start;
             auto prev = CCPoint{q.x, q.y};
             CCPoint end = prev;
             bool died = false;
-            for (int i = 0; i < H; i++) {
+            for (int i = 0; i < HP; i++) {
                 bool fire = std::find(presses.begin(), presses.end(), i) != presses.end();
                 sim::step(q, f->vx, fire);
                 CCPoint p{q.x, q.y};
@@ -1476,11 +1498,11 @@ class $modify(BotPlayLayer, PlayLayer) {
                 // Second press: the first later frame where pressing keeps the path alive
                 std::vector<int> presses{planFrame};
                 auto w = start;
-                for (int i = 0; i < H; i++) {
+                for (int i = 0; i < HP; i++) {
                     if (i > planFrame && sim::canAct(w)) {
                         auto j = w;
                         sim::step(j, f->vx, true);
-                        if (!j.dead && sim::deathFrame(j, f->vx, H - i - 1) < 0) {
+                        if (!j.dead && sim::deathFrame(j, f->vx, HP - i - 1) < 0) {
                             presses.push_back(i);
                             break;
                         }
@@ -1701,7 +1723,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
         if (f->cooldown > 0) return;
         // Nothing close enough to hit: don't plan or press yet. Only react to a real threat.
-        if (d > 40) return;
+        if (d > 40 && !this->deathAhead(s.x, 250.f)) return;
 
         // Find the widest window of frames where a press survives.
         auto findWindow = [&](float margin, float& aimX, float& lastX) -> bool {
