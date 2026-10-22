@@ -730,6 +730,9 @@ static int slopeCorner(GameObject* obj) {
 //   2 = death the sim did NOT predict, likely a physics or hitbox error (magenta X)
 struct Marker { float x, y; int type; };
 
+// One recorded attempt: the presses it made and how far it got
+struct Run { std::vector<float> presses; float progress; };
+
 class $modify(BotPlayLayer, PlayLayer) {
     struct Fields {
         bool prevLayout = false;
@@ -783,6 +786,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         // Replay: press/toggle x positions of this attempt and the best attempt so far
         std::vector<float> curPresses, bestPresses;
+        std::vector<Run> runs; // best attempts this session, furthest first (max 3)
         float maxX = -1e9f, bestX = -1e9f;
         size_t replayIdx = 0;
         bool replayActive = false;
@@ -1019,20 +1023,26 @@ class $modify(BotPlayLayer, PlayLayer) {
             int t = m_fields->lastPredDeath ? 0 : 2;
             this->addMarker(player->getPositionX(), player->getPositionY(), t);
             if (t == 2) m_fields->learnedMargin = std::min(m_fields->learnedMargin + 0.5f, MAX_LEARNED_MARGIN);
-            if (m_fields->maxX > m_fields->bestX) {
-                m_fields->bestX = m_fields->maxX;
-                m_fields->bestPresses = m_fields->curPresses;
-            }
+            m_fields->runs.push_back(Run{m_fields->curPresses, m_fields->maxX});
+            std::sort(m_fields->runs.begin(), m_fields->runs.end(),
+                      [](Run const& a, Run const& b) { return a.progress > b.progress; });
+            if (m_fields->runs.size() > 3) m_fields->runs.resize(3);
             // Remove the press that led into this death from the recorded path (only that one),
             // so replay doesn't repeat it and the planner must find another jump there.
             {
                 float dx = player->getPositionX();
-                auto& bp = m_fields->bestPresses;
-                for (size_t i = bp.size(); i-- > 0;) {
-                    if (bp[i] <= dx + 5.f && bp[i] >= dx - 300.f) {
-                        bp.erase(bp.begin() + i);
-                        break;
+                for (auto& run : m_fields->runs) {
+                    auto& bp = run.presses;
+                    for (size_t i = bp.size(); i-- > 0;) {
+                        if (bp[i] <= dx + 5.f && bp[i] >= dx - 300.f) {
+                            bp.erase(bp.begin() + i);
+                            break;
+                        }
                     }
+                }
+                if (!m_fields->runs.empty()) {
+                    m_fields->bestX = m_fields->runs[0].progress;
+                    m_fields->bestPresses = m_fields->runs[0].presses;
                 }
             }
         }
@@ -1335,6 +1345,31 @@ class $modify(BotPlayLayer, PlayLayer) {
         return false;
     }
 
+    // Looks through the recorded runs for a press ahead of s that the sim says survives
+    // longer than not pressing. Returns its x in outX.
+    bool scanRecordedOption(sim::S s, float vx, int H, float& outX) {
+        for (auto const& run : m_fields.self()->runs) {
+            for (float px : run.presses) {
+                if (px < s.x || px > s.x + 200.f) continue;
+                int frames = static_cast<int>(std::ceil((px - s.x) / vx));
+                sim::S w = s;
+                bool ok = true;
+                for (int i = 0; i < frames && ok; i++) {
+                    sim::step(w, vx, false);
+                    if (w.dead) ok = false;
+                }
+                if (!ok || !sim::canAct(w)) continue;
+                int dn = sim::deathFrame(w, vx, H);
+                sim::S j = w;
+                sim::step(j, vx, true);
+                if (j.dead) continue;
+                int dj = sim::deathFrame(j, vx, H);
+                if (dj < 0 || dj > dn) { outX = px; return true; }
+            }
+        }
+        return false;
+    }
+
     // True if an earlier attempt died within `range` units ahead of x
     bool deathAhead(float x, float range) {
         for (float dx : m_fields.self()->deathXs) {
@@ -1493,10 +1528,37 @@ class $modify(BotPlayLayer, PlayLayer) {
                      : ccc4f(col.r, col.g, col.b, 0.85f));
         };
 
+        // Preview: if no plan is committed yet, find the best next press anyway (same scoring
+        // as the fallback: survival plus a bonus for orbs), so the next jump/orb always shows.
+        int previewK = -1;
+        if (g.bot && !f->havePlan) {
+            int bestScore = -1;
+            auto w2 = start;
+            for (int i = 0; i < HP; i++) {
+                if (sim::canAct(w2)) {
+                    auto j = w2;
+                    sim::step(j, f->vx, true);
+                    int depth = j.dead ? 0 : sim::deathFrame(j, f->vx, HP);
+                    if (depth < 0) depth = HP;
+                    bool orb = !j.dead && j.lock >= 0 && j.lock < (int)sim::boxes.size() &&
+                               sim::isOrb(sim::boxes[j.lock].kind);
+                    int score = depth + (orb ? 40 : 0);
+                    if (score > bestScore) { bestScore = score; previewK = i; }
+                }
+                sim::step(w2, f->vx, false);
+                if (w2.dead) break;
+            }
+        }
+
+        int planFrame = -1;
         if (g.bot && f->havePlan) {
-            int planFrame = static_cast<int>(std::round((f->planX - start.x) / f->vx));
+            planFrame = static_cast<int>(std::round((f->planX - start.x) / f->vx));
+        } else if (g.bot) {
+            planFrame = previewK;
+        }
+        {
             if (planFrame >= 0) {
-                planFrame = std::min(planFrame, H - 1);
+                planFrame = std::min(planFrame, HP - 1);
                 // Second press: the first later frame where pressing keeps the path alive
                 std::vector<int> presses{planFrame};
                 auto w = start;
@@ -1617,10 +1679,18 @@ class $modify(BotPlayLayer, PlayLayer) {
                     f->replayActive = false;
                 } else {
                     if (s.x >= rx) {
-                        f->botHolding = !f->botHolding;
-                        f->curPresses.push_back(s.x);
-                        this->pressJump(f->botHolding);
-                        f->replayIdx++;
+                        // Only replay a toggle the wave sim says is safe; otherwise let the planner decide
+                        waveSim::S j = s;
+                        waveSim::step(j, f->vx, !f->botHolding);
+                        if (!j.dead) {
+                            f->botHolding = !f->botHolding;
+                            f->curPresses.push_back(s.x);
+                            this->pressJump(f->botHolding);
+                            f->replayIdx++;
+                        } else {
+                            f->replayActive = false;
+                            f->replayResumeX = s.x + 60.f;
+                        }
                     }
                     return;
                 }
@@ -1692,8 +1762,29 @@ class $modify(BotPlayLayer, PlayLayer) {
                     f->replayResumeX = s.x + 60.f;
                 } else {
                     if (act && s.x + vx * 0.5f >= rx) {
-                        this->botPress(s);
-                        f->replayIdx++;
+                        // Only replay a press the sim agrees with: it must survive longer than not pressing
+                        auto j = s;
+                        sim::step(j, vx, true);
+                        int dj = j.dead ? 0 : sim::deathFrame(j, vx, H);
+                        bool safe = !j.dead && (dj < 0 || dj > d);
+                        if (safe || d > 40) {
+                            this->botPress(s);
+                            f->replayIdx++;
+                        } else {
+                            // Recorded press is unsafe: look for a safe press from another recorded run
+                            float alt = 0.f;
+                            f->replayActive = false;
+                            if (this->scanRecordedOption(s, vx, H, alt)) {
+                                f->havePlan = true;
+                                f->planX = alt;
+                                f->planFirstX = alt;
+                                f->planDeadlineX = alt + vx * 2.f;
+                                f->planIdle = 0;
+                                f->planAge = 0;
+                            } else {
+                                f->replayResumeX = s.x + 60.f;
+                            }
+                        }
                     }
                     return;
                 }
