@@ -26,6 +26,8 @@ constexpr int SLOPE_BASE_CORNER = 1;
 constexpr bool ENABLE_CALIBRATION = false;
 // Upper limit for the learned hazard margin (in level units).
 constexpr float MAX_LEARNED_MARGIN = 2.f;
+// Replay the best earlier attempt's presses. Off: it made every retry copy the same path.
+constexpr bool ENABLE_REPLAY = false;
 
 struct State {
     bool layout = false;
@@ -739,6 +741,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool stepHookSeen = false;
         CCLabelBMFont* cpsLabel = nullptr;
         CCLabelBMFont* warnLabel = nullptr;
+        std::vector<float> deathXs; // x of every death this session, kept across retries
         int predDeathIn = -1;
 
         bool haveLast = false;
@@ -1008,6 +1011,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         if (player == m_player1) {
+            m_fields->deathXs.push_back(player->getPositionX());
             int t = m_fields->lastPredDeath ? 0 : 2;
             this->addMarker(player->getPositionX(), player->getPositionY(), t);
             if (t == 2) m_fields->learnedMargin = std::min(m_fields->learnedMargin + 0.5f, MAX_LEARNED_MARGIN);
@@ -1037,7 +1041,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->curPresses.clear();
         f->maxX = -1e9f;
         f->replayIdx = 0;
-        f->replayActive = !f->bestPresses.empty();
+        f->replayActive = ENABLE_REPLAY && !f->bestPresses.empty();
         f->calibHave = false;
         f->calibJumpPending = false;
         f->lockIdx = -1;
@@ -1304,6 +1308,14 @@ class $modify(BotPlayLayer, PlayLayer) {
             auto start = this->currentSimState();
             this->drawCubeTrajectoryBody(start);
         }
+    }
+
+    // True if a jump at x would land us in the region where an earlier attempt died
+    bool nearPastDeath(float x) {
+        for (float dx : m_fields.self()->deathXs) {
+            if (x >= dx - 100.f && x <= dx + 5.f) return true;
+        }
+        return false;
     }
 
     void addMarker(float x, float y, int type) {
@@ -1622,6 +1634,8 @@ class $modify(BotPlayLayer, PlayLayer) {
             }
         }
         if (f->cooldown > 0) return;
+        // Nothing close enough to hit: don't plan or press yet. Only react to a real threat.
+        if (d > 40) return;
 
         // Find the widest window of frames where a press survives.
         auto findWindow = [&](float margin, float& aimX, float& lastX) -> bool {
@@ -1639,7 +1653,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                 int bestFirst = -1, bestLast = -1, runFirst = -1;
                 auto w = s;
                 for (int k = 0; k <= dm; k++) {
-                    if (!sim::canAct(w)) {
+                    if (!sim::canAct(w) || this->nearPastDeath(s.x + vx * k)) {
                         runFirst = -1;
                     } else if (extra == 0 || (k & 1) == 0) {
                         auto j = w;
@@ -1689,7 +1703,7 @@ class $modify(BotPlayLayer, PlayLayer) {
             int bestK = -1, bestDepth = d;
             auto w = s;
             for (int k = 0; k <= d; k++) {
-                if (sim::canAct(w)) {
+                if (sim::canAct(w) && !this->nearPastDeath(s.x + vx * k)) {
                     auto j = w;
                     sim::step(j, vx, true);
                     int depth = j.dead ? 0 : sim::deathFrame(j, vx, H);
