@@ -14,12 +14,6 @@
 
 using namespace geode::prelude;
 
-#if defined(GEODE_IS_ANDROID) || defined(GEODE_IS_IOS)
-constexpr float DEFAULT_HUD_SCALE = 1.3f;
-#else
-constexpr float DEFAULT_HUD_SCALE = 1.0f;
-#endif
-
 // Draw what the bot "sees" (cyan = solid, red = hazard, yellow = slope, purple = orb/pad/portal)
 // whenever Trajectory is on. Set to false once everything looks right.
 constexpr bool SHOW_SIM_BOXES = true;
@@ -27,51 +21,35 @@ constexpr bool SHOW_SIM_BOXES = true;
 // 0 = bottom-left, 1 = bottom-right, 2 = top-left, 3 = top-right.
 // If the yellow debug triangles look mirrored, change this.
 constexpr int SLOPE_BASE_CORNER = 1;
+// Calibration of jump/grav from play. Off by default: it drifted the sim's jump arc
+// too low on a real level, which made the bot think it couldn't clear obstacles.
+constexpr bool ENABLE_CALIBRATION = false;
+// Upper limit for the learned hazard margin (in level units).
+constexpr float MAX_LEARNED_MARGIN = 2.f;
 
 struct State {
-    bool noclip = false;
-    bool counter = false;
-    bool jump = false;
-    bool clicker = false;
     bool layout = false;
-    bool speedOn = false;
     bool trajectory = false;
     bool bot = false;
-    float speed = 1.f;
-    float cps = 10.f;
-    float hudScale = DEFAULT_HUD_SCALE;
-
-    bool hudEdit = false;
-    bool hudResetRequested = false;
+    bool cpsCounter = false;
+    bool botInput = false;      // true while the bot presses, so its clicks are not counted
+    float clock = 0.f;          // seconds, advanced every tick
+    std::vector<float> clicks;  // times of the player's recent clicks
 
     void load() {
         auto m = Mod::get();
-        noclip     = m->getSavedValue<bool>("noclip", false);
-        counter    = m->getSavedValue<bool>("counter", false);
-        jump       = m->getSavedValue<bool>("jump", false);
-        clicker    = m->getSavedValue<bool>("clicker", false);
         layout     = m->getSavedValue<bool>("layout", false);
-        speedOn    = m->getSavedValue<bool>("speedOn", false);
         trajectory = m->getSavedValue<bool>("trajectory", false);
         bot        = m->getSavedValue<bool>("bot", false);
-        speed      = m->getSavedValue<float>("speed", 1.f);
-        cps        = m->getSavedValue<float>("cps", 10.f);
-        hudScale   = m->getSavedValue<float>("hudScale", DEFAULT_HUD_SCALE);
+        cpsCounter = m->getSavedValue<bool>("cpsCounter", false);
     }
 
     void save() {
         auto m = Mod::get();
-        m->setSavedValue<bool>("noclip", noclip);
-        m->setSavedValue<bool>("counter", counter);
-        m->setSavedValue<bool>("jump", jump);
-        m->setSavedValue<bool>("clicker", clicker);
         m->setSavedValue<bool>("layout", layout);
-        m->setSavedValue<bool>("speedOn", speedOn);
         m->setSavedValue<bool>("trajectory", trajectory);
         m->setSavedValue<bool>("bot", bot);
-        m->setSavedValue<float>("speed", speed);
-        m->setSavedValue<float>("cps", cps);
-        m->setSavedValue<float>("hudScale", hudScale);
+        m->setSavedValue<bool>("cpsCounter", cpsCounter);
     }
 };
 
@@ -81,12 +59,6 @@ $on_mod(Loaded) {
     g.load();
 }
 
-class $modify(SpeedScheduler, CCScheduler) {
-    void update(float dt) {
-        if (g.speedOn && PlayLayer::get()) dt *= g.speed;
-        CCScheduler::update(dt);
-    }
-};
 
 // ===============================================================
 // Cube physics simulator
@@ -337,75 +309,56 @@ namespace sim {
 }
 
 // ===============================================================
-// Wave planner: replaces the entire `namespace waveSim { ... }`
-// block in main.cpp, and the wave-related bot functions
-// (tickWaveBot / waveHoldNow / drawWaveTrajectoryBody) as noted below.
-//
-// Model (from how Geometry Dash's wave generally behaves; not verified
-// against the game's source):
-//   - Forward speed is constant (vx).
-//   - Vertical speed is also constant, +vx or -vx, set by the hold state.
-//     Hold tilts the wave up, release tilts it down.
-//   - Gravity is flipped (flip = true) inverts the sign of the vertical motion.
-//
-// Everything that's a guess is a constant at the top so you can tune it.
-// ===============================================================
-
-namespace waveSim {
-
-    // ---- TUNABLE CONSTANTS ------------------------------------------------
-    // Half-size of the wave's collision box (in level units).
-    // Starting guess. Compare the cyan debug box in the overlay with the sprite.
-    constexpr float WAVE_HALF      = 8.f;
-
-    // Half-size of the hazard (spike) box for wave. Usually a bit smaller
-    // than WAVE_HALF so grazing spikes don't kill the bot unfairly.
-    constexpr float WAVE_HAZ_HALF  = 6.f;
-
-    // Vertical speed multiplier relative to vx. 1.0 = 45 degree tilt.
-    // If the wave's path in the game looks steeper or shallower than the
-    // bot predicts, change this.
-    constexpr float WAVE_SPEED_MUL = 1.0f;
-
-    // Physics substeps per frame. Matches the cube sim (2) by default.
-    constexpr int   WAVE_SUBSTEPS  = 2;
-
-    // Max frames to look ahead when planning. Larger = smarter, slower.
-    constexpr int   MAXH           = 64;
-
-    // Planner size. Must be at least (2*MAXH+1)*2.
-    constexpr int   NODES          = (2 * MAXH + 1) * 2;
-    // ---------------------------------------------------------------------
+// Wave planner: replaces the entire `namespace waveSim {
+    // ---- TUNABLE ----------------------------------------------------------
+    constexpr float WAVE_HALF        = 8.f;   // collision half-size vs solid blocks and slopes
+    constexpr float WAVE_HAZ_HALF    = 6.f;   // hazard (spike) half-size
+    constexpr float WAVE_SPEED_MUL   = 1.0f;  // vertical speed relative to vx (45 degrees)
+    constexpr int   WAVE_SUBSTEPS    = 2;
+    // Extra room kept from the hard floor/ceiling bounds (sim::floorY / sim::ceilY).
+    // Raise it if the wave clips edges, lower it if the bot hugs them too much.
+    constexpr float WAVE_EDGE_MARGIN = 0.f;
+    // How far ahead to plan, in frames. Longer = sees tight gaps earlier.
+    constexpr int   MAXH             = 128;
+    // How much a larger clearance is worth, relative to one frame of survival.
+    constexpr float CLEAR_WEIGHT     = 0.25f;
+    // Score gap needed before the bot switches input (stops flicker).
+    constexpr float SWITCH_MARGIN    = 3.f;
+    constexpr float CLEAR_CAP        = 40.f;  // clearance beyond this is treated as "plenty"
+    constexpr float CLEAR_X_RANGE    = 24.f;  // only obstacles this close in x count for clearance
+    constexpr int   NODES            = (2 * MAXH + 1) * 2;
+    // -----------------------------------------------------------------------
 
     struct S {
         float x = 0.f, y = 0.f;
-        bool hold = false;   // current input: held (tilts up) or released (tilts down)
-        bool flip = false;   // gravity flipped
+        bool hold = false;
+        bool flip = false;
         bool dead = false;
     };
 
-    // Vertical direction for a given input and gravity state.
-    inline int dirOf(bool hold, bool flip) {
-        return (hold != flip) ? +1 : -1;
-    }
+    // Result per first input: 0 = release, 1 = hold.
+    struct Option {
+        bool alive = false;  // survives at least one frame
+        int depth = 0;       // frames survived (max over paths), up to MAXH
+        float clear = 0.f;   // best clearance seen on a path reaching that depth
+        float score() const { return depth + CLEAR_WEIGHT * clear; }
+    };
 
-    // Advance one frame with the given input.
+    inline int dirOf(bool hold, bool flip) { return (hold != flip) ? +1 : -1; }
+
     inline void step(S& s, float vx, bool hold) {
         if (s.dead) return;
         s.hold = hold;
         int dir = dirOf(hold, s.flip);
         float dt = 1.f / WAVE_SUBSTEPS;
-
         for (int i = 0; i < WAVE_SUBSTEPS && !s.dead; i++) {
             s.x += vx * dt;
             s.y += dir * vx * WAVE_SPEED_MUL * dt;
-
-            // Ceiling / floor (same bounds the cube sim uses)
-            if (s.y - WAVE_HALF < sim::floorY || s.y + WAVE_HALF > sim::ceilY) {
+            if (s.y - WAVE_HALF < sim::floorY + WAVE_EDGE_MARGIN ||
+                s.y + WAVE_HALF > sim::ceilY - WAVE_EDGE_MARGIN) {
                 s.dead = true;
                 return;
             }
-
             sim::forEachNear(s.x, [&](sim::Box const& b) {
                 if (s.dead) return;
                 switch (b.kind) {
@@ -418,48 +371,61 @@ namespace waveSim {
                     case sim::Slope:
                         if (sim::slopeOverlap(s.x, s.y, WAVE_HALF, b)) s.dead = true;
                         break;
-                    default:
-                        break;
+                    default: break;
                 }
             });
         }
     }
 
-    // One lattice node per (y index, last input). y index is in units of
-    // vx * WAVE_SPEED_MUL per frame, so the lattice is exact for constant speed.
+    // Vertical gap between the wave and the nearest solid/hazard/slope that is
+    // close in x. 0 = touching, CLEAR_CAP = nothing near. Higher is safer.
+    inline float clearance(S const& s) {
+        float best = CLEAR_CAP;
+        sim::forEachNear(s.x, [&](sim::Box const& b) {
+            if (b.kind != sim::Solid && b.kind != sim::Hazard && b.kind != sim::Slope) return;
+            if (s.x + CLEAR_X_RANGE < b.x0 || s.x - CLEAR_X_RANGE > b.x1) return;
+            float gap;
+            if (b.y1 <= s.y)      gap = (s.y - WAVE_HALF) - b.y1;   // box below
+            else if (b.y0 >= s.y) gap = b.y0 - (s.y + WAVE_HALF);   // box above
+            else                  gap = 0.f;                        // overlapping vertically
+            best = std::min(best, std::max(gap, 0.f));
+        });
+        return std::min(best, CLEAR_CAP);
+    }
+
     struct Node {
         S s;
-        int n = 0;          // y lattice index relative to start
-        uint8_t first = 0;  // bit0 = first action was release, bit1 = first action was hold
+        int n = 0;
+        uint8_t first = 0;     // bit h set = reached via first input h
+        float minClear = 0.f;  // best (max) minimum clearance along the path so far
         bool valid = false;
     };
 
-    // Returns a bitmask of first actions that keep the wave alive for H frames.
-    // bit0 = release, bit1 = hold. Returns 0 if every first action dies.
-    // If the wave survives the whole horizon, returns the mask of safe first actions.
-    inline int plan(S start, float vx, int H) {
-        H = std::min(H, MAXH);
+    // Plans H frames ahead. Fills out[0] (release first) and out[1] (hold first).
+    // Each option records how far its best path survives and how much room it keeps.
+    inline void plan(S start, float vx, int H, Option out[2]) {
+        H = std::clamp(H, 1, MAXH);
+        out[0] = Option{};
+        out[1] = Option{};
 
-        // Two buffers, reused. Static so the planner doesn't allocate every tick.
         static Node bufA[NODES], bufB[NODES];
         Node* cur = bufA;
         Node* nxt = bufB;
-
         for (int i = 0; i < NODES; i++) cur[i] = Node{};
+
         int c0 = MAXH * 2 + (start.hold ? 1 : 0);
         cur[c0].s = start;
         cur[c0].n = 0;
+        cur[c0].minClear = CLEAR_CAP;
         cur[c0].valid = true;
 
-        int lastMask = 0;
         for (int t = 0; t < H; t++) {
             for (int i = 0; i < NODES; i++) nxt[i].valid = false;
-            int mask = 0;
+            bool any = false;
 
             for (int i = 0; i < NODES; i++) {
                 Node const& nd = cur[i];
                 if (!nd.valid) continue;
-
                 for (int h = 0; h < 2; h++) {
                     S s = nd.s;
                     step(s, vx, h == 1);
@@ -469,25 +435,37 @@ namespace waveSim {
                     int key = (n + MAXH) * 2 + h;
                     if (key < 0 || key >= NODES) continue;
 
+                    float c = std::min(nd.minClear, clearance(s));
                     uint8_t first = (t == 0) ? static_cast<uint8_t>(1 << h) : nd.first;
+
                     Node& d = nxt[key];
                     if (!d.valid) {
-                        d.s = s; d.n = n; d.first = first; d.valid = true;
+                        d.s = s; d.n = n; d.first = first; d.minClear = c; d.valid = true;
                     } else {
                         d.first |= first;
+                        d.minClear = std::max(d.minClear, c);
                     }
-                    mask |= first;
+                    any = true;
+
+                    // Record survival depth per first input
+                    for (int k = 0; k < 2; k++) {
+                        if (!(first & (1 << k))) continue;
+                        Option& o = out[k];
+                        int depth = t + 1;
+                        if (depth > o.depth || (depth == o.depth && c > o.clear)) {
+                            o.depth = depth;
+                            o.clear = c;
+                        }
+                        o.alive = true;
+                    }
                 }
             }
 
-            if (mask == 0) return lastMask; // everything dies at frame t, keep the last good answer
-            lastMask = mask;
+            if (!any) return; // everything dies this frame; out already holds the best depths
             std::swap(cur, nxt);
         }
-        return lastMask;
     }
 }
-
 
 // ===============================================================
 // Draggable node
@@ -626,9 +604,6 @@ public:
 // ===============================================================
 class BotMenu : public Popup {
 protected:
-    CCLabelBMFont* m_speedLabel = nullptr;
-    CCLabelBMFont* m_cpsLabel = nullptr;
-    CCLabelBMFont* m_hudLabel = nullptr;
 
     bool init() {
         if (!Popup::init(340.f, 290.f)) return false;
@@ -639,43 +614,10 @@ protected:
         m_mainLayer->addChild(menu);
 
         constexpr float L = -150.f, R = 15.f;
-        this->addToggle(menu, "Noclip",        g.noclip,     L, 100.f);
-        this->addToggle(menu, "Noclip Stats",  g.counter,    R, 100.f);
-        this->addToggle(menu, "Autoclicker",   g.clicker,    L, 72.f);
-        this->addToggle(menu, "Infinite Jump", g.jump,       R, 72.f);
-        this->addToggle(menu, "Layout Mode",   g.layout,     L, 44.f);
-        this->addToggle(menu, "Speedhack",     g.speedOn,    R, 44.f);
-        this->addToggle(menu, "Trajectory",    g.trajectory, L, 16.f);
-        this->addToggle(menu, "Auto Bot",      g.bot,        R, 16.f);
-        this->addToggle(menu, "Move HUD",      g.hudEdit,    L, -12.f);
-
-        auto resetSpr = ButtonSprite::create("Reset HUD", 80, true, "bigFont.fnt", "GJ_button_04.png", 24.f, 0.5f);
-        auto resetBtn = CCMenuItemExt::createSpriteExtra(resetSpr, [](CCMenuItemSpriteExtra*) {
-            g.hudResetRequested = true;
-        });
-        resetBtn->setPosition({R + 55.f, -12.f});
-        menu->addChild(resetBtn);
-
-        m_speedLabel = this->addStepper(menu, -45.f, [this](int dir) {
-            g.speed = std::clamp(std::round((g.speed + dir * 0.1f) * 10.f) / 10.f, 0.1f, 5.f);
-            g.save();
-            m_speedLabel->setString(fmt::format("Speed: {:.1f}x", g.speed).c_str());
-        });
-        m_speedLabel->setString(fmt::format("Speed: {:.1f}x", g.speed).c_str());
-
-        m_cpsLabel = this->addStepper(menu, -75.f, [this](int dir) {
-            g.cps = std::clamp(std::round(g.cps + dir), 1.f, 30.f);
-            g.save();
-            m_cpsLabel->setString(fmt::format("Click CPS: {:.0f}", g.cps).c_str());
-        });
-        m_cpsLabel->setString(fmt::format("Click CPS: {:.0f}", g.cps).c_str());
-
-        m_hudLabel = this->addStepper(menu, -105.f, [this](int dir) {
-            g.hudScale = std::clamp(std::round((g.hudScale + dir * 0.1f) * 10.f) / 10.f, 0.5f, 2.5f);
-            g.save();
-            m_hudLabel->setString(fmt::format("HUD Size: {:.1f}x", g.hudScale).c_str());
-        });
-        m_hudLabel->setString(fmt::format("HUD Size: {:.1f}x", g.hudScale).c_str());
+        this->addToggle(menu, "Layout Mode",   g.layout,     L, 100.f);
+        this->addToggle(menu, "CPS Counter",   g.cpsCounter, R, 100.f);
+        this->addToggle(menu, "Trajectory",    g.trajectory, L, 72.f);
+        this->addToggle(menu, "Auto Bot",      g.bot,        R, 72.f);
 
         return true;
     }
@@ -699,28 +641,6 @@ protected:
         label->setAnchorPoint({0.f, 0.5f});
         label->setPosition({x + 20.f, y});
         menu->addChild(label);
-    }
-
-    CCLabelBMFont* addStepper(CCMenu* menu, float y, std::function<void(int)> change) {
-        auto label = CCLabelBMFont::create("", "bigFont.fnt");
-        label->setScale(0.5f);
-        label->setPosition({0.f, y});
-        menu->addChild(label);
-
-        auto leftSpr = CCSprite::createWithSpriteFrameName("navArrowBtn_001.png");
-        leftSpr->setFlipX(true);
-        leftSpr->setScale(0.6f);
-        auto left = CCMenuItemExt::createSpriteExtra(leftSpr, [change](CCMenuItemSpriteExtra*) { change(-1); });
-        left->setPosition({-105.f, y});
-        menu->addChild(left);
-
-        auto rightSpr = CCSprite::createWithSpriteFrameName("navArrowBtn_001.png");
-        rightSpr->setScale(0.6f);
-        auto right = CCMenuItemExt::createSpriteExtra(rightSpr, [change](CCMenuItemSpriteExtra*) { change(1); });
-        right->setPosition({105.f, y});
-        menu->addChild(right);
-
-        return label;
     }
 
 public:
@@ -748,10 +668,11 @@ class $modify(LayoutGameObject, GameObject) {
 // ===============================================================
 // Infinite Jump
 // ===============================================================
-class $modify(JumpPlayer, PlayerObject) {
+class $modify(ClickPlayer, PlayerObject) {
     bool pushButton(PlayerButton btn) {
-        if (g.jump && btn == PlayerButton::Jump && PlayLayer::get()) {
-            m_isOnGround = true;
+        if (!g.botInput && btn == PlayerButton::Jump) {
+            auto pl = PlayLayer::get();
+            if (pl && pl->m_player1 == this) g.clicks.push_back(g.clock);
         }
         return PlayerObject::pushButton(btn);
     }
@@ -814,21 +735,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool geometryBuilt = false;
         float lastRebuildX = -1e9f;
 
-        float clickTimer = 0.f;
-        float holdTimer = 0.f;
-        bool holding = false;
-
-        bool hitFlag = false;
         bool stepHookSeen = false;
-        int stepsSinceHit = 1000;
-        int deaths = 0;
-        long totalSteps = 0;
-        long deadSteps = 0;
-        int labelTick = 0;
-
-        DraggableNode* hud = nullptr;
-        CCLabelBMFont* hudLabel = nullptr;
-        extension::CCScale9Sprite* hudBg = nullptr;
+        CCLabelBMFont* cpsLabel = nullptr;
 
         bool haveLast = false;
         float lastX = 0.f, lastY = 0.f;
@@ -929,29 +837,6 @@ class $modify(BotPlayLayer, PlayLayer) {
             ui->addChild(btn, 1000);
         }
 
-        if (auto hud = DraggableNode::create({170.f, 26.f}, "hud-x", "hud-y",
-                                             [] { return g.hudEdit; }, nullptr)) {
-            auto hbg = extension::CCScale9Sprite::create("square02_small.png");
-            hbg->setContentSize({170.f, 26.f});
-            hbg->setOpacity(120);
-            hbg->setPosition({85.f, 13.f});
-            hud->addChild(hbg);
-
-            auto label = CCLabelBMFont::create("Deaths: 0   Acc: 100.0%", "bigFont.fnt");
-            label->setScale(0.38f);
-            label->setPosition({85.f, 13.f});
-            hud->addChild(label);
-
-            hud->restorePosition({win.width / 2.f, win.height - 48.f});
-            hud->setScale(g.hudScale);
-            hud->setVisible(false);
-            ui->addChild(hud, 999);
-
-            m_fields->hud = hud;
-            m_fields->hudLabel = label;
-            m_fields->hudBg = hbg;
-        }
-
         if (m_objectLayer) {
             auto node = CCDrawNode::create();
             m_objectLayer->addChild(node, 1000);
@@ -962,6 +847,13 @@ class $modify(BotPlayLayer, PlayLayer) {
             m_objectLayer->addChild(mn, 1001);
             m_fields->markerNode = mn;
         }
+
+        auto cps = CCLabelBMFont::create("CPS: 0", "bigFont.fnt");
+        cps->setScale(0.5f);
+        cps->setPosition({win.width / 2.f, win.height - 80.f});
+        cps->setVisible(g.cpsCounter);
+        ui->addChild(cps, 999);
+        m_fields->cpsLabel = cps;
 
         auto status = CCLabelBMFont::create("", "bigFont.fnt");
         status->setScale(0.35f);
@@ -1097,21 +989,19 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     void pressJump(bool down) {
+        g.botInput = true;
         this->handleButton(down, 1, true);
         if (m_gameState.m_isDualMode && m_player2) {
             this->handleButton(down, 1, false);
         }
+        g.botInput = false;
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (g.noclip) {
-            m_fields->hitFlag = true;
-            return;
-        }
         if (player == m_player1) {
             int t = m_fields->lastPredDeath ? 0 : 2;
             this->addMarker(player->getPositionX(), player->getPositionY(), t);
-            if (t == 2) m_fields->learnedMargin = std::min(m_fields->learnedMargin + 0.5f, 8.f);
+            if (t == 2) m_fields->learnedMargin = std::min(m_fields->learnedMargin + 0.5f, MAX_LEARNED_MARGIN);
             if (m_fields->maxX > m_fields->bestX) {
                 m_fields->bestX = m_fields->maxX;
                 m_fields->bestPresses = m_fields->curPresses;
@@ -1125,10 +1015,7 @@ class $modify(BotPlayLayer, PlayLayer) {
     void resetLevel() {
         PlayLayer::resetLevel();
         auto f = m_fields.self();
-        if (f->holding || f->botHolding) this->pressJump(false);
-        f->clickTimer = 0.f;
-        f->holdTimer = 0.f;
-        f->holding = false;
+        if (f->botHolding) this->pressJump(false);
         f->botHolding = false;
         f->botRelease = 0;
         f->havePlan = false;
@@ -1145,11 +1032,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->calibHave = false;
         f->calibJumpPending = false;
         f->lockIdx = -1;
-        f->deaths = 0;
-        f->totalSteps = 0;
-        f->deadSteps = 0;
-        f->stepsSinceHit = 1000;
-        f->hitFlag = false;
+        g.clicks.clear();
+        g.clock = 0.f;
         f->stepInit = false;
         f->haveLast = false;
 
@@ -1188,17 +1072,15 @@ class $modify(BotPlayLayer, PlayLayer) {
             f->trajDirty = true;
         }
 
-        this->updateHud();
-        this->tickNoclipStats();
+        g.clock += dt;
         this->measure(dt);
+        this->updateCps();
         if (m_player1 && !m_player1->m_isDead) f->maxX = std::max(f->maxX, m_player1->getPositionX());
         this->calibrate();
 
-        if (!g.clicker && f->holding) { f->holding = false; this->pressJump(false); }
         if (!g.bot && f->botHolding) { f->botHolding = false; f->botRelease = 0; this->pressJump(false); }
 
         if (g.bot) this->tickBot();
-        else if (g.clicker) this->tickAutoclicker(dt);
 
         if (!g.bot && m_player1) {
             if (this->cubeMode()) {
@@ -1210,7 +1092,9 @@ class $modify(BotPlayLayer, PlayLayer) {
                 ws.y = m_player1->getPositionY();
                 ws.flip = m_player1->m_isUpsideDown;
                 ws.hold = f->botHolding;
-                f->lastPredDeath = waveSim::plan(ws, f->vx, std::min(sim::horizon(f->vx), waveSim::MAXH)) == 0;
+                waveSim::Option o[2];
+                waveSim::plan(ws, f->vx, std::min(sim::horizon(f->vx), waveSim::MAXH), o);
+                f->lastPredDeath = !o[0].alive && !o[1].alive;
             }
         }
         this->drawTrajectory();
@@ -1247,97 +1131,21 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
     }
 
-    void updateHud() {
-        auto f = m_fields.self();
-        if (!f->hud) return;
-
-        auto win = CCDirector::sharedDirector()->getWinSize();
-        if (g.hudResetRequested) {
-            g.hudResetRequested = false;
-            g.hudScale = DEFAULT_HUD_SCALE;
-            g.save();
-            f->hud->resetPosition({win.width / 2.f, win.height - 48.f});
-        }
-
-        f->hud->setScale(g.hudScale);
-        bool show = g.counter || g.hudEdit;
-        f->hud->setVisible(show);
-
-        if (f->hudBg) f->hudBg->setColor(g.hudEdit ? ccColor3B{255, 220, 60} : ccColor3B{255, 255, 255});
-    }
-
-    void registerStep(bool fromStepHook) {
-        auto f = m_fields.self();
-        bool hit = f->hitFlag;
-        f->hitFlag = false;
-
-        if (!g.noclip) {
-            f->stepsSinceHit = 1000;
-            return;
-        }
-
-        int gap = fromStepHook ? 6 : 2;
-        f->totalSteps++;
-        if (hit) {
-            if (f->stepsSinceHit <= gap) {
-                f->deadSteps += f->stepsSinceHit;
-            } else {
-                f->deaths++;
-            }
-            f->deadSteps++;
-            f->stepsSinceHit = 0;
-        } else if (f->stepsSinceHit < 1000) {
-            f->stepsSinceHit++;
-        }
-    }
-
     void onPhysicsStep() {
         auto f = m_fields.self();
         f->stepHookSeen = true;
         f->stepsThisTick++;
-        this->registerStep(true);
     }
 
-    void tickNoclipStats() {
+    void updateCps() {
         auto f = m_fields.self();
-
-        if (!f->stepHookSeen) {
-            this->registerStep(false);
+        while (!g.clicks.empty() && g.clicks.front() < g.clock - 1.f) {
+            g.clicks.erase(g.clicks.begin());
         }
-
-        if (f->hudLabel && ++f->labelTick >= 6) {
-            f->labelTick = 0;
-            float acc = f->totalSteps > 0
-                ? 100.f * (1.f - static_cast<float>(f->deadSteps) / static_cast<float>(f->totalSteps))
-                : 100.f;
-            f->hudLabel->setString(fmt::format("Deaths: {}   Acc: {:.1f}%", f->deaths, acc).c_str());
-            float w = f->hudLabel->getContentSize().width;
-            float sc = std::min(0.38f, 160.f / std::max(w, 1.f));
-            f->hudLabel->setScale(sc);
-        }
-    }
-
-    void tickAutoclicker(float dt) {
-        if (!m_player1 || m_player1->m_isDead) return;
-        auto f = m_fields.self();
-        float interval = 1.f / g.cps;
-        float hold = std::min(0.04f, interval * 0.5f);
-
-        if (f->holding) {
-            f->holdTimer -= dt;
-            if (f->holdTimer <= 0.f) {
-                f->holding = false;
-                this->pressJump(false);
-            }
-            return;
-        }
-
-        f->clickTimer += dt;
-        if (f->clickTimer >= interval) {
-            f->clickTimer = 0.f;
-            f->holding = true;
-            f->holdTimer = hold;
-            this->pressJump(true);
+        if (!f->cpsLabel) return;
+        f->cpsLabel->setVisible(g.cpsCounter);
+        if (g.cpsCounter) {
+            f->cpsLabel->setString(fmt::format("CPS: {}", g.clicks.size()).c_str());
         }
     }
 
@@ -1484,6 +1292,11 @@ class $modify(BotPlayLayer, PlayLayer) {
     // Jump velocity comes from the first frame after a ground press (vy + grav ~ jumpVel).
     void calibrate() {
         auto f = m_fields.self();
+        if (!ENABLE_CALIBRATION) {
+            sim::jumpVel = 11.180032f;
+            sim::grav = 0.958199f;
+            return;
+        }
         if (!m_player1 || !this->cubeMode() || m_player1->m_isUpsideDown) {
             f->calibHave = false;
             f->calibJumpPending = false;
@@ -1673,15 +1486,17 @@ class $modify(BotPlayLayer, PlayLayer) {
         s.flip = m_player1->m_isUpsideDown;
         s.hold = f->botHolding;
 
-        int H = std::min(sim::horizon(f->vx), waveSim::MAXH);
-        int mask = waveSim::plan(s, f->vx, H);
-        f->lastPredDeath = (mask == 0);
-        if (mask == 0) {
+        int H = std::min(waveSim::MAXH, std::max(sim::horizon(f->vx), 96));
+        waveSim::Option opt[2];
+        waveSim::plan(s, f->vx, H, opt);
+
+        f->lastPredDeath = !opt[0].alive && !opt[1].alive;
+        if (f->lastPredDeath) {
             this->addMarker(s.x, s.y, 1);
             return; // nothing survives, keep current input
         }
 
-        // Follow the best previous attempt's toggles while they still line up
+        // Replay the best previous attempt's toggles while they still line up
         if (f->replayActive) {
             if (f->replayIdx >= f->bestPresses.size()) {
                 f->replayActive = false;
@@ -1702,9 +1517,19 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
 
         bool cur = f->botHolding;
-        // Keep the current input if it's still safe, otherwise switch.
-        bool keepSafe = (mask & (cur ? 2 : 1)) != 0;
-        bool want = keepSafe ? cur : !cur;
+        int curIdx = cur ? 1 : 0;
+        int otherIdx = 1 - curIdx;
+
+        // Keep the current input unless the other one is clearly better,
+        // or the current one dies while the other survives.
+        bool want = cur;
+        if (!opt[curIdx].alive && opt[otherIdx].alive) {
+            want = !cur;
+        } else if (opt[otherIdx].alive &&
+                   opt[otherIdx].score() > opt[curIdx].score() + waveSim::SWITCH_MARGIN) {
+            want = !cur;
+        }
+
         if (want != cur) {
             f->botHolding = want;
             f->curPresses.push_back(s.x);
@@ -1822,7 +1647,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         if (!ok) {
             this->addMarker(s.x, s.y, 1);
-            if (act && d <= 3) this->botPress(s, 6); // last-ditch jump
+            if (act && d <= 6) this->botPress(s, 6); // last-ditch jump
             return;
         }
 
