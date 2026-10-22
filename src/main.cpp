@@ -308,8 +308,7 @@ namespace sim {
     };
 }
 
-// ===============================================================
-// Wave planner: replaces the entire `namespace waveSim {
+namespace waveSim {
     // ---- TUNABLE ----------------------------------------------------------
     constexpr float WAVE_HALF        = 8.f;   // collision half-size vs solid blocks and slopes
     constexpr float WAVE_HAZ_HALF    = 6.f;   // hazard (spike) half-size
