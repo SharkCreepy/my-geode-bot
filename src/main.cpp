@@ -773,6 +773,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         float planDeadlineX = 0.f;
         float planFirstX = 0.f;
         float replayResumeX = -1e9f;
+        bool orbSeen = false; // an orb press was among the fallback options this tick
         int planIdle = 0;
         int cooldown = 0;
         int planAge = 0;
@@ -1028,7 +1029,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                 float dx = player->getPositionX();
                 auto& bp = m_fields->bestPresses;
                 for (size_t i = bp.size(); i-- > 0;) {
-                    if (bp[i] <= dx + 5.f && bp[i] >= dx - 100.f) {
+                    if (bp[i] <= dx + 5.f && bp[i] >= dx - 300.f) {
                         bp.erase(bp.begin() + i);
                         break;
                     }
@@ -1155,9 +1156,10 @@ class $modify(BotPlayLayer, PlayLayer) {
         else if (this->waveMode()) msg = fmt::format("Wave | S{} H{} L{} | {} v3", sim::nSolid, sim::nHazard, sim::nSlope, g.bot ? "bot" : "traj");
         else if (!this->cubeMode()) msg = "Unsupported gamemode (cube + wave only)";
         else if (sim::boxes.empty() && sim::wide.empty()) msg = "No level geometry found";
-        else msg = fmt::format("S{} H{} L{} P{} O{} G{} | jump {:.2f}/{:.3f} | {} v3",
+        else msg = fmt::format("S{} H{} L{} P{} O{} G{} | jump {:.2f}/{:.3f} | {}{} v3",
                                sim::nSolid, sim::nHazard, sim::nSlope, sim::nPad, sim::nOrb, sim::nPortal,
-                               sim::jumpVel, sim::grav, g.bot ? "bot" : "traj");
+                               sim::jumpVel, sim::grav, g.bot ? "bot" : "traj",
+                               f->orbSeen ? " | orb option" : "");
 
         if (msg != f->lastStatus) {
             f->lastStatus = msg;
@@ -1328,7 +1330,7 @@ class $modify(BotPlayLayer, PlayLayer) {
     // True if a jump at x would land us in the region where an earlier attempt died
     bool nearPastDeath(float x) {
         for (float dx : m_fields.self()->deathXs) {
-            if (x >= dx - 100.f && x <= dx + 5.f) return true;
+            if (x >= dx - 300.f && x <= dx + 5.f) return true; // a jump's arc covers ~300 units
         }
         return false;
     }
@@ -1790,6 +1792,8 @@ class $modify(BotPlayLayer, PlayLayer) {
             // No jump clears everything in the look-ahead. Instead of waiting until death is
             // imminent, take the press frame that survives longest (better than doing nothing).
             int bestK = -1, bestDepth = d;
+            int bestScore = d;
+            f->orbSeen = false;
             auto w = s;
             for (int k = 0; k <= d; k++) {
                 if (sim::canAct(w) && !this->nearPastDeath(s.x + vx * k)) {
@@ -1797,7 +1801,16 @@ class $modify(BotPlayLayer, PlayLayer) {
                     sim::step(j, vx, true);
                     int depth = j.dead ? 0 : sim::deathFrame(j, vx, H);
                     if (depth < 0) depth = H; // survives the whole horizon
-                    if (depth > bestDepth || (bestK >= 0 && depth == bestDepth)) { bestDepth = depth; bestK = k; }
+                    // Orb presses get a bonus: they change direction and clear obstacles
+                    bool orb = !j.dead && j.lock >= 0 && j.lock < (int)sim::boxes.size() &&
+                               sim::isOrb(sim::boxes[j.lock].kind);
+                    if (orb) f->orbSeen = true;
+                    int score = depth + (orb ? 40 : 0);
+                    if (score > bestScore || (bestK >= 0 && score == bestScore)) {
+                        bestScore = score;
+                        bestDepth = depth;
+                        bestK = k;
+                    }
                 }
                 sim::step(w, vx, false);
                 if (w.dead) break;
