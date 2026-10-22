@@ -1694,9 +1694,12 @@ class $modify(BotPlayLayer, PlayLayer) {
                 } else {
                     if (s.x >= rx) {
                         // Only replay a toggle the wave sim says is safe; otherwise let the planner decide
-                        waveSim::S j = s;
-                        waveSim::step(j, f->vx, !f->botHolding);
-                        if (!j.dead) {
+                        // Check the toggle against the full wave look-ahead, not just one frame
+                        waveSim::Option o[2];
+                        waveSim::plan(s, f->vx, H, o);
+                        int newIdx = f->botHolding ? 0 : 1;
+                        bool safe = o[newIdx].alive && o[newIdx].depth >= H;
+                        if (safe) {
                             f->botHolding = !f->botHolding;
                             f->curPresses.push_back(s.x);
                             this->pressJump(f->botHolding);
@@ -1817,23 +1820,54 @@ class $modify(BotPlayLayer, PlayLayer) {
         // Commit to the plan that is drawn on screen. Only drop it if the window was missed,
         // so the bot actually follows the blue path instead of replanning past the press point.
         if (f->havePlan) {
-            if (s.x > f->planDeadlineX + vx * 2.f) {
-                if (f->hasPlanB && f->planBX > s.x) {
-                    // Plan A failed: switch to plan B
-                    f->planX = f->planBX;
-                    f->planFirstX = f->planBX;
-                    f->planDeadlineX = f->planBX + vx * 2.f;
-                    f->hasPlanB = false;
-                    f->planAge = 0;
-                    return;
+            int pf = static_cast<int>(std::round((f->planX - s.x) / vx));
+            bool missed = s.x > f->planDeadlineX + vx * 2.f;
+            // Check plan A against the sim from here: does pressing at its planned frame still survive?
+            bool aFails = false;
+            if (!missed && pf >= 0) {
+                sim::S w = s;
+                for (int i = 0; i < H && !aFails; i++) {
+                    sim::step(w, vx, i == pf);
+                    if (w.dead) aFails = true;
                 }
-                f->havePlan = false; // plan B also failed (or none): replan, which brings back plan A
+            }
+            if ((missed || aFails) && f->hasPlanB && f->planBX > s.x) {
+                // Plan A failed: switch to plan B
+                f->planX = f->planBX;
+                f->planFirstX = f->planBX;
+                f->planDeadlineX = f->planBX + vx * 2.f;
+                f->hasPlanB = false;
+                f->planAge = 0;
+                return;
+            }
+            if (missed || aFails) {
+                f->havePlan = false; // no backup left: replan from here
             } else {
                 // On the ground press at the planned spot. In the air (orbs), press on the first
                 // frame the orb is reachable inside the planned window.
+                // In the air, look 1.5 frames ahead to cover input lag (the game applies a press a
+                // frame or so after it is sent), so orb presses land on the planned frame, not after it.
                 bool inWindow = s.ground ? (s.x + vx * 0.5f >= f->planX)
-                                         : (s.x + vx * 0.5f >= f->planFirstX);
-                if (act && inWindow) this->botPress(s);
+                                         : (s.x + vx * 1.5f >= f->planFirstX);
+                if (act && inWindow) {
+                    // Per-frame trajectory check: press now only if pressing now survives at least as
+                    // long as pressing one frame later. Otherwise wait for the better frame.
+                    int H2 = sim::horizon(vx);
+                    sim::S now = s;
+                    sim::step(now, vx, true);
+                    int dNow = now.dead ? 0 : sim::deathFrame(now, vx, H2);
+                    if (dNow < 0) dNow = H2;
+                    sim::S later = s;
+                    sim::step(later, vx, false);
+                    bool laterOk = !later.dead && sim::canAct(later);
+                    int dLater = 0;
+                    if (laterOk) {
+                        sim::step(later, vx, true);
+                        dLater = later.dead ? 0 : sim::deathFrame(later, vx, H2);
+                        if (dLater < 0) dLater = H2;
+                    }
+                    if (!laterOk || dNow >= dLater) this->botPress(s);
+                }
                 return;
             }
         }
@@ -1946,19 +1980,25 @@ class $modify(BotPlayLayer, PlayLayer) {
         // Plan B: another press that survives the look-ahead, at least 8 frames away from plan A
         f->hasPlanB = false;
         {
-            float bestDist = 1e9f;
+            float bestScore = -1e9f;
             auto wb = s;
             for (int k = 0; k <= std::min(d, 60); k++) {
                 if (sim::canAct(wb)) {
                     float px = s.x + vx * k;
                     float dist = std::abs(px - aimX);
-                    if (dist >= 8.f * vx && dist < bestDist) {
+                    if (dist >= 8.f * vx) {
                         auto jb = wb;
                         sim::step(jb, vx, true);
                         if (!jb.dead && sim::deathFrame(jb, vx, H) < 0) {
-                            bestDist = dist;
-                            f->planBX = px;
-                            f->hasPlanB = true;
+                            // Prefer a route that uses an orb (a different route), then the nearest
+                            bool orb = jb.lock >= 0 && jb.lock < (int)sim::boxes.size() &&
+                                       sim::isOrb(sim::boxes[jb.lock].kind);
+                            float sc = (orb ? 40.f : 0.f) - dist / vx;
+                            if (sc > bestScore) {
+                                bestScore = sc;
+                                f->planBX = px;
+                                f->hasPlanB = true;
+                            }
                         }
                     }
                 }
