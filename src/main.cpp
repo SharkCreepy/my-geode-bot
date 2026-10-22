@@ -775,6 +775,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         float planX = 0.f;
         float planDeadlineX = 0.f;
         float planFirstX = 0.f;
+        bool hasPlanB = false; // backup press (plan B) for the committed plan (plan A)
+        float planBX = 0.f;
         float replayResumeX = -1e9f;
         bool orbSeen = false; // an orb press was among the fallback options this tick
         int planIdle = 0;
@@ -1583,6 +1585,18 @@ class $modify(BotPlayLayer, PlayLayer) {
 
     void botPress(sim::S const& s, int cooldown = 1) {
         auto f = m_fields.self();
+        // Trajectory gate: every cube press must be justified by the sim. If not pressing
+        // survives the horizon, don't press. Otherwise pressing must survive longer.
+        {
+            int H = sim::horizon(f->vx);
+            int dn = sim::deathFrame(s, f->vx, H);
+            if (dn < 0) return;
+            sim::S j = s;
+            sim::step(j, f->vx, true);
+            bool helps = !j.dead && (sim::deathFrame(j, f->vx, H) < 0 ||
+                                     sim::deathFrame(j, f->vx, H) > dn);
+            if (!helps) return;
+        }
         if (!s.ground) {
             f->lockIdx = sim::findOrb(s);
         } else {
@@ -1804,7 +1818,16 @@ class $modify(BotPlayLayer, PlayLayer) {
         // so the bot actually follows the blue path instead of replanning past the press point.
         if (f->havePlan) {
             if (s.x > f->planDeadlineX + vx * 2.f) {
-                f->havePlan = false; // missed the window, replan below
+                if (f->hasPlanB && f->planBX > s.x) {
+                    // Plan A failed: switch to plan B
+                    f->planX = f->planBX;
+                    f->planFirstX = f->planBX;
+                    f->planDeadlineX = f->planBX + vx * 2.f;
+                    f->hasPlanB = false;
+                    f->planAge = 0;
+                    return;
+                }
+                f->havePlan = false; // plan B also failed (or none): replan, which brings back plan A
             } else {
                 // On the ground press at the planned spot. In the air (orbs), press on the first
                 // frame the orb is reachable inside the planned window.
@@ -1920,6 +1943,29 @@ class $modify(BotPlayLayer, PlayLayer) {
             return;
         }
 
+        // Plan B: another press that survives the look-ahead, at least 8 frames away from plan A
+        f->hasPlanB = false;
+        {
+            float bestDist = 1e9f;
+            auto wb = s;
+            for (int k = 0; k <= std::min(d, 60); k++) {
+                if (sim::canAct(wb)) {
+                    float px = s.x + vx * k;
+                    float dist = std::abs(px - aimX);
+                    if (dist >= 8.f * vx && dist < bestDist) {
+                        auto jb = wb;
+                        sim::step(jb, vx, true);
+                        if (!jb.dead && sim::deathFrame(jb, vx, H) < 0) {
+                            bestDist = dist;
+                            f->planBX = px;
+                            f->hasPlanB = true;
+                        }
+                    }
+                }
+                sim::step(wb, vx, false);
+                if (wb.dead) break;
+            }
+        }
         f->havePlan = true;
         f->planX = aimX;
         f->planDeadlineX = lastX + vx * 0.5f;
