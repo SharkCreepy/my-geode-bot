@@ -1585,14 +1585,15 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
         if (d < 0) { f->havePlan = false; return; } // nothing to avoid
 
-        // Re-plan every few ticks so a bad velocity estimate can't hold a stale plan forever
+        // Commit to the plan that is drawn on screen. Only drop it if the window was missed,
+        // so the bot actually follows the blue path instead of replanning past the press point.
         if (f->havePlan) {
-            if (++f->planAge >= 4 || s.x > f->planDeadlineX) f->havePlan = false;
-        }
-        if (f->havePlan) {
-            // press at the planned spot, or immediately if death is about to happen
-            if (act && (s.x + vx * 0.5f >= f->planX || d <= 1)) this->botPress(s);
-            return;
+            if (s.x > f->planDeadlineX + vx * 2.f) {
+                f->havePlan = false; // missed the window, replan below
+            } else {
+                if (act && (s.x + vx * 0.5f >= f->planX || d <= 1)) this->botPress(s);
+                return;
+            }
         }
         if (f->cooldown > 0) return;
 
@@ -1648,8 +1649,27 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         if (!ok) {
             this->addMarker(s.x, s.y, 1);
-            if (act && d <= 6) this->botPress(s, 6); // last-ditch jump
-            return;
+            // No jump clears everything in the look-ahead. Instead of waiting until death is
+            // imminent, take the press frame that survives longest (better than doing nothing).
+            int bestK = -1, bestDepth = d;
+            auto w = s;
+            for (int k = 0; k <= d; k++) {
+                if (sim::canAct(w)) {
+                    auto j = w;
+                    sim::step(j, vx, true);
+                    int depth = j.dead ? 0 : sim::deathFrame(j, vx, H);
+                    if (depth < 0) depth = H; // survives the whole horizon
+                    if (depth > bestDepth) { bestDepth = depth; bestK = k; }
+                }
+                sim::step(w, vx, false);
+                if (w.dead) break;
+            }
+            if (bestK < 0) {
+                if (act && d <= 6) this->botPress(s, 6); // nothing helps, last-ditch jump
+                return;
+            }
+            aimX = s.x + vx * bestK;
+            lastX = aimX;
         }
 
         if (act && s.x + vx * 0.5f >= aimX) {
