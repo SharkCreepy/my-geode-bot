@@ -73,7 +73,7 @@ namespace sim {
         KindCount
     };
 
-    struct Box { float x0, y0, x1, y1; int kind; GameObject* src = nullptr; int corner = 0; };
+    struct Box { float x0, y0, x1, y1; int kind; GameObject* src = nullptr; int corner = 0; float px = 0.f, py = 0.f; };
 
     inline std::vector<Box> boxes;
     inline std::vector<Box> wide;
@@ -319,10 +319,11 @@ namespace waveSim {
     constexpr float WAVE_EDGE_MARGIN = 0.f;
     // How far ahead to plan, in frames. Longer = sees tight gaps earlier.
     constexpr int   MAXH             = 128;
-    // How much a larger clearance is worth, relative to one frame of survival.
-    constexpr float CLEAR_WEIGHT     = 0.25f;
+    // Each frame survived is worth this many points. Clearance (max 40) only breaks ties,
+    // so a path that dies earlier always loses to one that survives longer.
+    constexpr float DEPTH_WEIGHT     = 10.f;
     // Score gap needed before the bot switches input (stops flicker).
-    constexpr float SWITCH_MARGIN    = 3.f;
+    constexpr float SWITCH_MARGIN    = 4.f;
     constexpr float CLEAR_CAP        = 40.f;  // clearance beyond this is treated as "plenty"
     constexpr float CLEAR_X_RANGE    = 24.f;  // only obstacles this close in x count for clearance
     constexpr int   NODES            = (2 * MAXH + 1) * 2;
@@ -340,7 +341,7 @@ namespace waveSim {
         bool alive = false;  // survives at least one frame
         int depth = 0;       // frames survived (max over paths), up to MAXH
         float clear = 0.f;   // best clearance seen on a path reaching that depth
-        float score() const { return depth + CLEAR_WEIGHT * clear; }
+        float score() const { return DEPTH_WEIGHT * depth + clear; }
     };
 
     inline int dirOf(bool hold, bool flip) { return (hold != flip) ? +1 : -1; }
@@ -380,6 +381,9 @@ namespace waveSim {
     // close in x. 0 = touching, CLEAR_CAP = nothing near. Higher is safer.
     inline float clearance(S const& s) {
         float best = CLEAR_CAP;
+        // The floor and ceiling count as obstacles, so the bot prefers the middle of the corridor
+        best = std::min(best, (s.y - WAVE_HALF) - sim::floorY);
+        best = std::min(best, sim::ceilY - (s.y + WAVE_HALF));
         sim::forEachNear(s.x, [&](sim::Box const& b) {
             if (b.kind != sim::Solid && b.kind != sim::Hazard && b.kind != sim::Slope) return;
             if (s.x + CLEAR_X_RANGE < b.x0 || s.x - CLEAR_X_RANGE > b.x1) return;
@@ -389,7 +393,7 @@ namespace waveSim {
             else                  gap = 0.f;                        // overlapping vertically
             best = std::min(best, std::max(gap, 0.f));
         });
-        return std::min(best, CLEAR_CAP);
+        return std::clamp(best, 0.f, CLEAR_CAP);
     }
 
     struct Node {
@@ -869,12 +873,20 @@ class $modify(BotPlayLayer, PlayLayer) {
         return true;
     }
 
-    void buildGeometry() {
-        std::unordered_map<GameObject*, std::pair<float,float>> oldPos;
-        for (auto const& b : sim::boxes) {
-            if (b.src) oldPos[b.src] = {b.x0, b.y0};
-        }
+    // True if any solid/hazard the sim knows about has moved since the last rebuild
+    // (moving platforms, moving spikes, etc).
+    bool geometryMoved() {
+        auto check = [](sim::Box const& b) {
+            if (!b.src) return false;
+            auto p = b.src->getPosition();
+            return std::abs(p.x - b.px) > 0.5f || std::abs(p.y - b.py) > 0.5f;
+        };
+        for (auto const& b : sim::boxes) if (check(b)) return true;
+        for (auto const& b : sim::wide) if (check(b)) return true;
+        return false;
+    }
 
+    void buildGeometry() {
         sim::boxes.clear();
         sim::wide.clear();
         sim::maxW = 30.f;
@@ -949,20 +961,10 @@ class $modify(BotPlayLayer, PlayLayer) {
             }
             if (r.size.width <= 0.f || r.size.height <= 0.f) continue;
 
-            bool isDynamic = false;
-            auto oit = oldPos.find(obj);
-            if (oit != oldPos.end()) {
-                if (std::abs(oit->second.first  - r.origin.x) > 0.5f ||
-                    std::abs(oit->second.second - r.origin.y) > 0.5f) {
-                    isDynamic = true;
-                }
-            }
-            if (isDynamic && (kind == sim::Solid || kind == sim::Hazard)) {
-                continue;
-            }
-
             sim::Box b{r.origin.x, r.origin.y, r.origin.x + r.size.width,
                        r.origin.y + r.size.height, kind, obj};
+            b.px = pos.x;
+            b.py = pos.y;
             if (kind == sim::Slope) {
                 int c = slopeCorner(obj);
                 if (c < 0) continue;
@@ -1062,7 +1064,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         if ((!f->geometryBuilt && m_objects && m_objects->count() > 0) ||
             f->ticks == 20 || f->needRebuild ||
-            (f->geometryBuilt && (movedFar || timedOut))) {
+            (f->geometryBuilt && (movedFar || timedOut || this->geometryMoved()))) {
             f->geometryBuilt = true;
             f->needRebuild = false;
             f->lastRebuildX = px;
