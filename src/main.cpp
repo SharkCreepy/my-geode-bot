@@ -770,6 +770,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool havePlan = false;
         float planX = 0.f;
         float planDeadlineX = 0.f;
+        float planFirstX = 0.f;
         int planIdle = 0;
         int cooldown = 0;
         int planAge = 0;
@@ -1021,7 +1022,6 @@ class $modify(BotPlayLayer, PlayLayer) {
             }
         }
         m_fields->haveLast = false;
-        m_fields->vy = 0.f;
         PlayLayer::destroyPlayer(player, object);
     }
 
@@ -1621,7 +1621,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                 }
             }
         }
-        if (d < 0) { f->havePlan = false; return; } // nothing to avoid
+        if (d < 0 && !f->havePlan) return; // nothing to avoid, and no plan to keep
 
         // Commit to the plan that is drawn on screen. Only drop it if the window was missed,
         // so the bot actually follows the blue path instead of replanning past the press point.
@@ -1629,7 +1629,11 @@ class $modify(BotPlayLayer, PlayLayer) {
             if (s.x > f->planDeadlineX + vx * 2.f) {
                 f->havePlan = false; // missed the window, replan below
             } else {
-                if (act && (s.x + vx * 0.5f >= f->planX || d <= 1)) this->botPress(s);
+                // On the ground press at the planned spot. In the air (orbs), press on the first
+                // frame the orb is reachable inside the planned window.
+                bool inWindow = s.ground ? (s.x + vx * 0.5f >= f->planX)
+                                         : (s.x + vx * 0.5f >= f->planFirstX);
+                if (act && inWindow) this->botPress(s);
                 return;
             }
         }
@@ -1673,6 +1677,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                     if (w.dead) break;
                 }
                 if (bestFirst >= 0) {
+                    m_fields.self()->planFirstX = s.x + vx * bestFirst;
                     aimX = s.x + vx * (bestFirst + (bestLast - bestFirst) * 0.5f);
                     lastX = s.x + vx * bestLast;
                     return true;
@@ -1719,6 +1724,7 @@ class $modify(BotPlayLayer, PlayLayer) {
             }
             aimX = s.x + vx * bestK;
             lastX = aimX;
+            f->planFirstX = aimX;
         }
 
         if (act && s.x + vx * 0.5f >= aimX) {
