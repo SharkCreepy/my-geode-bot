@@ -90,7 +90,7 @@ namespace sim {
 
     constexpr float HALF = 15.f;
     constexpr float HAZ_HALF = 11.f; // Slightly forgiving spike hitbox
-    constexpr float ORB_HALF = 12.f;
+    constexpr float ORB_HALF = 15.f; // widened from 12: the cube counts as touching an orb sooner
     constexpr float TERMINAL = -15.f;
     constexpr int SUB = 2;
 
@@ -1638,9 +1638,14 @@ class $modify(BotPlayLayer, PlayLayer) {
             }
             std::stable_sort(cands.begin(), cands.end(),
                              [](std::pair<int, int> const& x, std::pair<int, int> const& y) {
-                                 return x.first > y.first;
+                                 // Best survival first; on a tie take the LATER press, so the bot
+                             // doesn't jump early when waiting also survives (orbs, pads)
+                             return x.first > y.first || (x.first == y.first && x.second > y.second);
                              });
-            if (!cands.empty()) previewK = cands[0].second;
+            // Only show a press if it beats doing nothing, the same rule the bot uses
+            int noPress = sim::deathFrame(start, f->vx, HP);
+            if (noPress < 0) noPress = HP;
+            if (!cands.empty() && cands[0].first > noPress) previewK = cands[0].second;
             for (auto const& c : cands) {
                 if (previewK >= 0 && std::abs(c.second - previewK) >= 8) { previewK2 = c.second; break; }
             }
@@ -1861,7 +1866,9 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
         std::stable_sort(cands.begin(), cands.end(),
                          [](std::pair<int, int> const& x, std::pair<int, int> const& y) {
-                             return x.first > y.first;
+                             // Best survival first; on a tie take the LATER press, so the bot
+                             // doesn't jump early when waiting also survives (orbs, pads)
+                             return x.first > y.first || (x.first == y.first && x.second > y.second);
                          });
         int aK = -1, aScore = 0, bK = -1; // plan A = best, plan B = best at least 8 frames away
 
