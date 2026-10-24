@@ -424,8 +424,6 @@ namespace waveSim {
     inline float clearance(S const& s) {
         float best = CLEAR_CAP;
         // The floor and ceiling count as obstacles, so the bot prefers the middle of the corridor
-        best = std::min(best, (s.y - WAVE_HALF) - sim::floorY);
-        best = std::min(best, sim::ceilY - (s.y + WAVE_HALF));
         sim::forEachNear(s.x, [&](sim::Box const& b) {
             if (b.kind != sim::Solid && b.kind != sim::Hazard && b.kind != sim::Slope) return;
             if (s.x + CLEAR_X_RANGE < b.x0 || s.x - CLEAR_X_RANGE > b.x1) return;
@@ -1536,6 +1534,26 @@ class $modify(BotPlayLayer, PlayLayer) {
             if (b.kind == sim::Hazard) col = ccc4f(1.f, 0.2f, 0.2f, 0.9f);
             else if (b.kind == sim::Slope) col = ccc4f(1.f, 1.f, 0.2f, 0.9f);
             else if (b.kind != sim::Solid) col = ccc4f(0.8f, 0.4f, 1.f, 0.8f);
+            // Orbs: draw the sim's orb hitbox as a circle (its real radius in the sim)
+            if (sim::isOrb(b.kind)) {
+                float cx = (b.x0 + b.x1) * 0.5f, cy = (b.y0 + b.y1) * 0.5f;
+                ccColor4F oc = ccc4f(1.f, 0.4f, 1.f, 0.9f);
+                const int seg = 16;
+                for (int i = 0; i < seg; i++) {
+                    float a0 = 6.2831853f * i / seg, a1 = 6.2831853f * (i + 1) / seg;
+                    CCPoint p0{cx + sim::ORB_HALF * std::cos(a0), cy + sim::ORB_HALF * std::sin(a0)};
+                    CCPoint p1{cx + sim::ORB_HALF * std::cos(a1), cy + sim::ORB_HALF * std::sin(a1)};
+                    f->traj->drawSegment(p0, p1, 1.f, oc);
+                }
+                return;
+            }
+            // Jump pads: draw the pad's box in yellow
+            if (sim::isPad(b.kind)) {
+                ccColor4F pc = ccc4f(1.f, 1.f, 0.3f, 0.9f);
+                CCPoint q[4] = {{b.x0, b.y0}, {b.x1, b.y0}, {b.x1, b.y1}, {b.x0, b.y1}};
+                for (int i = 0; i < 4; i++) f->traj->drawSegment(q[i], q[(i + 1) % 4], 1.f, pc);
+                return;
+            }
             CCPoint v[4];
             unsigned n = 4;
             if (b.kind == sim::Slope) {
@@ -1810,8 +1828,17 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
 
         bool cur = f->botHolding;
-        // Hold or release, whichever trajectory scores higher this frame
-        bool want = opt[1].score() > opt[0].score();
+        int curIdx = cur ? 1 : 0;
+        int otherIdx = 1 - curIdx;
+        // Keep the current input unless the other trajectory is clearly better,
+        // or the current one dies while the other survives. Stops rapid clicking.
+        bool want = cur;
+        if (!opt[curIdx].alive && opt[otherIdx].alive) {
+            want = !cur;
+        } else if (opt[otherIdx].alive &&
+                   opt[otherIdx].score() > opt[curIdx].score() + waveSim::SWITCH_MARGIN) {
+            want = !cur;
+        }
 
         if (want != cur) {
             f->botHolding = want;
@@ -1881,7 +1908,9 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
 
         // Keep the committed press point while it still survives; if it fails, switch to plan B
-        if (f->hasCommit && f->commitX < s.x - vx) f->hasCommit = false; // already passed it
+        // Passed the committed press point: drop it now and re-plan this frame, instead of
+        // holding a press that can no longer fire (that was the late-click bug)
+        if (f->hasCommit && std::round((f->commitX - s.x) / vx) < 0) f->hasCommit = false;
         if (f->hasCommit) {
             int kc = static_cast<int>(std::round((f->commitX - s.x) / vx));
             auto w2 = s;
