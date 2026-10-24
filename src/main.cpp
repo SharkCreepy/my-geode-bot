@@ -76,10 +76,13 @@ namespace sim {
         KindCount
     };
 
-    struct Box { float x0, y0, x1, y1; int kind; GameObject* src = nullptr; int corner = 0; float px = 0.f, py = 0.f; };
+    struct Box { float x0, y0, x1, y1; int kind; GameObject* src = nullptr; int corner = 0; float px = 0.f, py = 0.f;
+             bool round = false; float cx = 0.f, cy = 0.f, r = 0.f; };
 
     inline std::vector<Box> boxes;
     inline std::vector<Box> wide;
+    // Object IDs of round hazards (saws). Fill this in with the IDs you read from the hit-ID readout.
+    inline std::vector<int> sawIds = {};
     inline float maxW = 30.f;
     inline float floorY = 90.f;
     inline float ceilY = 600.f; // Give a little extra headroom
@@ -115,6 +118,15 @@ namespace sim {
     inline bool isPortal(int k) { return k == PortalNormal || k == PortalInverse; }
     inline bool flipsGravity(int k) { return k == PadBlue || k == OrbBlue || k == OrbGreen; }
 
+    // Hazard test: a circle (round saw) against the cube's square, or a plain box overlap
+    inline bool hazHit(float x, float y, float h, Box const& b) {
+        if (!b.round) return x + h > b.x0 && x - h < b.x1 && y + h > b.y0 && y - h < b.y1;
+        float qx = std::clamp(b.cx, x - h, x + h);
+        float qy = std::clamp(b.cy, y - h, y + h);
+        float dx = b.cx - qx, dy = b.cy - qy;
+        return dx * dx + dy * dy < b.r * b.r;
+    }
+
     inline bool overlap(float x, float y, float h, Box const& b) {
         return x + h > b.x0 && x - h < b.x1 && y + h > b.y0 && y - h < b.y1;
     }
@@ -127,6 +139,18 @@ namespace sim {
         float u = std::max(right ? (b.x1 - (x + h)) : ((x - h) - b.x0), 0.f);
         float v = std::max(top   ? (b.y1 - (y + h)) : ((y - h) - b.y0), 0.f);
         return u / W + v / H < 1.f;
+    }
+
+    // Height of the slope's top (hypotenuse) surface at x. Right angle at the bottom corner:
+    // the surface is high at the vertical side and low at the far end.
+    inline float slopeSurfaceY(Box const& b, float x) {
+        bool right = (b.corner & 1) != 0;
+        float W = std::max(b.x1 - b.x0, 1.f);
+        float cx = right ? b.x1 : b.x0;
+        float cy = b.y0;   // right-angle corner (bottom)
+        float py = b.y1;   // top end at the vertical side
+        float t = std::clamp(std::abs(x - cx) / W, 0.f, 1.f);
+        return py + (cy - py) * t;
     }
 
     inline std::vector<Box>::iterator firstNear(float x) {
@@ -212,13 +236,30 @@ namespace sim {
             });
             if (s.dead) break;
 
+            // Slopes (top surface only): land on them, die if the cube goes below them
+            if (!s.flip) {
+                forEachNear(s.x, [&](Box const& b) {
+                    if (b.kind != Slope || s.dead || (b.corner & 2)) return;
+                    if (s.x < b.x0 || s.x > b.x1) return;
+                    float surf = slopeSurfaceY(b, s.x);
+                    if (s.vy <= 0.f && prevBottom >= surf - 1.f && s.y - HALF <= surf + 1.f) {
+                        s.y = surf + HALF;
+                        s.vy = 0.f;
+                        s.ground = true;
+                    } else if (s.y - HALF < surf - 1.f) {
+                        s.dead = true;
+                    }
+                });
+                if (s.dead) break;
+            }
+
             s.x += vx * dt;
             forEachNear(s.x, [&](Box const& b) {
                 if (s.dead) return;
                 float u = s.flip ? -1.f : 1.f;
                 switch (b.kind) {
                     case Hazard:
-                        if (overlap(s.x, s.y, HAZ_HALF + hazMargin, b)) s.dead = true;
+                        if (hazHit(s.x, s.y, HAZ_HALF + hazMargin, b)) s.dead = true;
                         break;
                     case Solid:
                         if (overlap(s.x, s.y, HALF, b)) {
@@ -364,7 +405,7 @@ namespace waveSim {
                 if (s.dead) return;
                 switch (b.kind) {
                     case sim::Hazard:
-                        if (sim::overlap(s.x, s.y, WAVE_HAZ_HALF, b)) s.dead = true;
+                        if (sim::hazHit(s.x, s.y, WAVE_HAZ_HALF, b)) s.dead = true;
                         break;
                     case sim::Solid:
                         if (sim::overlap(s.x, s.y, WAVE_HALF, b)) s.dead = true;
@@ -745,6 +786,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool stepHookSeen = false;
         CCLabelBMFont* cpsLabel = nullptr;
         CCLabelBMFont* warnLabel = nullptr;
+        int lastHitId = -1; // object ID of the last thing that killed the cube
         std::vector<float> deathXs; // x of every death this session, kept across retries
         int predDeathIn = -1;
 
@@ -825,6 +867,12 @@ class $modify(BotPlayLayer, PlayLayer) {
             if (x + sim::HALF > b.x0 && x - sim::HALF < b.x1 &&
                 std::abs((ly - sim::HALF) - by1) < 1.5f) onBlock = true;
         });
+        if (!flip) {
+            sim::forEachNear(x, [&](sim::Box const& b) {
+                if (b.kind != sim::Slope || (b.corner & 2) || x < b.x0 || x > b.x1) return;
+                if (std::abs((ly - sim::HALF) - sim::slopeSurfaceY(b, x)) < 1.5f) onBlock = true;
+            });
+        }
         return onBlock;
     }
 
@@ -988,6 +1036,12 @@ class $modify(BotPlayLayer, PlayLayer) {
                        r.origin.y + r.size.height, kind, obj};
             b.px = pos.x;
             b.py = pos.y;
+            if (kind == sim::Hazard && std::find(sim::sawIds.begin(), sim::sawIds.end(), obj->m_objectID) != sim::sawIds.end()) {
+                b.round = true;
+                b.cx = (b.x0 + b.x1) * 0.5f;
+                b.cy = (b.y0 + b.y1) * 0.5f;
+                b.r = std::min(b.x1 - b.x0, b.y1 - b.y0) * 0.5f;
+            }
             if (kind == sim::Slope) {
                 int c = slopeCorner(obj);
                 if (c < 0) continue;
@@ -1023,6 +1077,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         if (player == m_player1) {
+            m_fields->lastHitId = object ? object->m_objectID : -1;
             m_fields->deathXs.push_back(player->getPositionX());
             int t = m_fields->lastPredDeath ? 0 : 2;
             this->addMarker(player->getPositionX(), player->getPositionY(), t);
@@ -1119,7 +1174,9 @@ class $modify(BotPlayLayer, PlayLayer) {
         this->updateCps();
         f->predDeathIn = -1;
         if (m_player1 && this->cubeMode()) {
-            f->predDeathIn = sim::deathFrame(this->currentSimState(), f->vx, sim::horizon(f->vx));
+            int H3 = sim::horizon(f->vx);
+            int best = this->bestSurvival(this->currentSimState(), f->vx, H3);
+            f->predDeathIn = best < H3 ? best : -1; // warn only if even the best trajectory hits
         }
         this->updateWarning();
         if (m_player1 && !m_player1->m_isDead) f->maxX = std::max(f->maxX, m_player1->getPositionX());
@@ -1174,6 +1231,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                                sim::jumpVel, sim::grav, g.bot ? "bot" : "traj",
                                f->orbSeen ? " | orb option" : "");
 
+        if (f->lastHitId >= 0) msg += fmt::format(" | hit id {}", f->lastHitId);
         if (msg != f->lastStatus) {
             f->lastStatus = msg;
             f->status->setString(msg.c_str());
@@ -1263,9 +1321,10 @@ class $modify(BotPlayLayer, PlayLayer) {
         s.dead = false;
         s.lock = -1;
 
+        // Standing on a block or the floor counts as ground at once, even while the cube's
+        // vertical speed is still settling after a drop. Otherwise the bot waits to press.
         bool geomGround = this->isOnLocalGround(s.x, s.y, flip);
-        bool isMoving = std::abs(m_player1->m_yVelocity) > 2.0f;
-        s.ground = (geomGround || m_player1->m_isOnGround) && !isMoving;
+        s.ground = geomGround || m_player1->m_isOnGround;
 
         s.vy = s.ground ? 0.f : f->vy * up;
 
@@ -1371,6 +1430,25 @@ class $modify(BotPlayLayer, PlayLayer) {
             }
         }
         return false;
+    }
+
+    // Frames survived by the best trajectory available (press now, later, or never). H = survives.
+    int bestSurvival(sim::S const& s, float vx, int H) {
+        int best = sim::deathFrame(s, vx, H);
+        if (best < 0) return H;
+        auto w = s;
+        for (int k = 0; k <= H; k++) {
+            if (sim::canAct(w)) {
+                auto j = w;
+                sim::step(j, vx, true);
+                int depth = j.dead ? 0 : sim::deathFrame(j, vx, H);
+                if (depth < 0) depth = H;
+                best = std::max(best, depth);
+            }
+            sim::step(w, vx, false);
+            if (w.dead) break;
+        }
+        return best;
     }
 
     // True if an earlier attempt died within `range` units ahead of x
@@ -1566,25 +1644,6 @@ class $modify(BotPlayLayer, PlayLayer) {
             for (auto const& c : cands) {
                 if (previewK >= 0 && std::abs(c.second - previewK) >= 8) { previewK2 = c.second; break; }
             }
-        }
-
-        // Plan B drawn in purple, with its own second press
-        if (previewK2 >= 0) {
-            std::vector<int> pr{previewK2};
-            auto ww = start;
-            for (int i = 0; i < HP; i++) {
-                if (i > previewK2 && sim::canAct(ww)) {
-                    auto jj = ww;
-                    sim::step(jj, f->vx, true);
-                    if (!jj.dead && sim::deathFrame(jj, f->vx, HP - i - 1) < 0) {
-                        pr.push_back(i);
-                        break;
-                    }
-                }
-                sim::step(ww, f->vx, i == previewK2);
-                if (ww.dead) break;
-            }
-            drawPresses(pr, ccc4f(0.8f, 0.4f, 1.f, 0.9f));
         }
 
         // Plan A drawn in blue
@@ -1783,7 +1842,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         // How long the cube survives if it never presses again
         int dNo = sim::deathFrame(s, vx, H);
-        f->lastPredDeath = dNo >= 0;
+        f->lastPredDeath = false;
         if (dNo < 0) return; // nothing ahead, don't press
 
         // Every frame where the cube can press, scored by how long it survives
@@ -1805,6 +1864,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                              return x.first > y.first;
                          });
         int aK = -1, aScore = 0, bK = -1; // plan A = best, plan B = best at least 8 frames away
+
         if (!cands.empty()) {
             aScore = cands[0].first;
             aK = cands[0].second;
@@ -1829,15 +1889,13 @@ class $modify(BotPlayLayer, PlayLayer) {
                 if (depth < 0) depth = H;
                 ok = !w2.dead && depth >= aScore - 10;
             }
-            if (!ok) {
-                if (bK >= 0) f->commitX = s.x + vx * bK; // switch to plan B
-                else f->hasCommit = false;
-            }
+            if (!ok) f->hasCommit = false; // re-pick the single best path below
         }
         if (!f->hasCommit && aK >= 0) {
             f->commitX = s.x + vx * aK;
             f->hasCommit = true;
         }
+        f->lastPredDeath = aScore < H; // even the best trajectory hits something
         if (!f->hasCommit) {
             this->addMarker(s.x, s.y, 1); // no press survives longer than not pressing
             return;
