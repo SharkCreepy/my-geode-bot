@@ -90,7 +90,7 @@ namespace sim {
 
     constexpr float HALF = 15.f;
     constexpr float HAZ_HALF = 11.f; // Slightly forgiving spike hitbox
-    constexpr float ORB_HALF = 15.f; // widened from 12: the cube counts as touching an orb sooner
+    constexpr float ORB_HALF = 12.f;
     constexpr float TERMINAL = -15.f;
     constexpr int SUB = 2;
 
@@ -231,27 +231,12 @@ namespace sim {
                     s.vy = 0.f;
                     s.ground = true;
                 } else if (s.vy > 0.f && prevTop <= by0 + 1.f) {
-                    s.dead = true; // hit the underside of a block
+                    ly = by0 - HALF;
+                    s.y = ly * up;
+                    s.vy = 0.f;
                 }
             });
             if (s.dead) break;
-
-            // Slopes (top surface only): land on them, die if the cube goes below them
-            if (!s.flip) {
-                forEachNear(s.x, [&](Box const& b) {
-                    if (b.kind != Slope || s.dead || (b.corner & 2)) return;
-                    if (s.x < b.x0 || s.x > b.x1) return;
-                    float surf = slopeSurfaceY(b, s.x);
-                    if (s.vy <= 0.f && prevBottom >= surf - 1.f && s.y - HALF <= surf + 1.f) {
-                        s.y = surf + HALF;
-                        s.vy = 0.f;
-                        s.ground = true;
-                    } else if (s.y - HALF < surf - 1.f) {
-                        s.dead = true;
-                    }
-                });
-                if (s.dead) break;
-            }
 
             s.x += vx * dt;
             forEachNear(s.x, [&](Box const& b) {
@@ -819,6 +804,17 @@ class $modify(BotPlayLayer, PlayLayer) {
         float planBX = 0.f;
         bool hasCommit = false; // the press point the bot is currently committed to
         float commitX = 0.f;
+        int previewAge = 0;
+        bool havePreviewX = false;
+        float cachedPreviewX = 0.f;
+        float predY = 0.f;            // sim's predicted y for the next tick
+        bool havePred = false;
+        bool pressedSincePred = false; // a press happened since the last prediction
+        float simErr = 0.f;            // average |real y - predicted y| for free-fall ticks
+        bool ballHave = false;
+        float ballPrevVy = 0.f;
+        float ballGrav = 0.f;   // measured ball gravity (speed change per frame)
+        int ballSamples = 0;
         float replayResumeX = -1e9f;
         bool orbSeen = false; // an orb press was among the fallback options this tick
         int planIdle = 0;
@@ -865,12 +861,6 @@ class $modify(BotPlayLayer, PlayLayer) {
             if (x + sim::HALF > b.x0 && x - sim::HALF < b.x1 &&
                 std::abs((ly - sim::HALF) - by1) < 1.5f) onBlock = true;
         });
-        if (!flip) {
-            sim::forEachNear(x, [&](sim::Box const& b) {
-                if (b.kind != sim::Slope || (b.corner & 2) || x < b.x0 || x > b.x1) return;
-                if (std::abs((ly - sim::HALF) - sim::slopeSurfaceY(b, x)) < 1.5f) onBlock = true;
-            });
-        }
         return onBlock;
     }
 
@@ -1065,6 +1055,7 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     void pressJump(bool down) {
+        if (down) m_fields.self()->pressedSincePred = true;
         g.botInput = true;
         this->handleButton(down, 1, true);
         if (m_gameState.m_isDualMode && m_player2) {
@@ -1169,6 +1160,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         g.clock += dt;
         this->measure(dt);
+        this->measureBallGravity();
         this->updateCps();
         f->predDeathIn = -1;
         if (m_player1 && this->cubeMode()) {
@@ -1182,6 +1174,8 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         if (!g.bot && f->botHolding) { f->botHolding = false; f->botRelease = 0; this->pressJump(false); }
 
+        this->checkSimError();
+        this->predictSim();
         if (g.bot) this->tickBot();
 
         if (!g.bot && m_player1) {
@@ -1222,6 +1216,10 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (!m_player1) msg = "no player";
         else if (m_player1->m_isDead) msg = "Dead, retrying";
         else if (this->waveMode()) msg = fmt::format("Wave | S{} H{} L{} | {} v3", sim::nSolid, sim::nHazard, sim::nSlope, g.bot ? "bot" : "traj");
+        else if (this->ballMode()) {
+            if (f->ballSamples < 5) msg = "Ball | measuring gravity (fall with no taps)";
+            else msg = fmt::format("Ball | gravity {:.3f}/frame ({} samples)", f->ballGrav, f->ballSamples);
+        }
         else if (!this->cubeMode()) msg = "Unsupported gamemode (cube + wave only)";
         else if (sim::boxes.empty() && sim::wide.empty()) msg = "No level geometry found";
         else msg = fmt::format("S{} H{} L{} P{} O{} G{} | jump {:.2f}/{:.3f} | {}{} v3",
@@ -1229,6 +1227,8 @@ class $modify(BotPlayLayer, PlayLayer) {
                                sim::jumpVel, sim::grav, g.bot ? "bot" : "traj",
                                f->orbSeen ? " | orb option" : "");
 
+        msg += fmt::format(" | vx {:.2f}", f->vx); // measured horizontal speed the sim uses
+        if (this->cubeMode()) msg += fmt::format(" | y err {:.1f}", f->simErr);
         if (f->lastHitId >= 0) msg += fmt::format(" | hit id {}", f->lastHitId);
         if (msg != f->lastStatus) {
             f->lastStatus = msg;
@@ -1252,6 +1252,58 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (show) {
             f->warnLabel->setString(fmt::format("WARNING: hit in {} frames", f->predDeathIn).c_str());
         }
+    }
+
+    bool ballMode() {
+        auto p = m_player1;
+        return p && !p->m_isDead && p->m_isBall;
+    }
+
+    // Measures ball gravity from free fall: the change in vertical speed per frame while the
+    // ball is in the air and not on the ground. Averaged with a slow filter.
+    void measureBallGravity() {
+        auto f = m_fields.self();
+        if (!m_player1 || !this->ballMode() || m_player1->m_isOnGround) {
+            f->ballHave = false;
+            return;
+        }
+        float vy = f->vy;
+        if (f->ballHave) {
+            float dv = std::abs(vy - f->ballPrevVy);
+            if (dv > 0.05f && dv < 3.f) {
+                if (f->ballSamples == 0) f->ballGrav = dv;
+                else f->ballGrav += 0.05f * (dv - f->ballGrav);
+                f->ballSamples++;
+            }
+        }
+        f->ballPrevVy = vy;
+        f->ballHave = true;
+    }
+
+    // Compares the real cube position with what the sim predicted last tick (no-press ticks only)
+    void checkSimError() {
+        auto f = m_fields.self();
+        if (!f->havePred || !m_player1 || !this->cubeMode()) {
+            f->havePred = false;
+            return;
+        }
+        if (!f->pressedSincePred) {
+            float err = std::abs(m_player1->getPositionY() - f->predY);
+            f->simErr = 0.95f * f->simErr + 0.05f * err;
+        }
+        f->havePred = false;
+    }
+
+    // Predicts where the cube will be next tick if it doesn't press
+    void predictSim() {
+        auto f = m_fields.self();
+        f->pressedSincePred = false;
+        if (!m_player1 || !this->cubeMode()) return;
+        sim::S n = this->currentSimState();
+        sim::step(n, f->vx, false);
+        if (n.dead) return;
+        f->predY = n.y;
+        f->havePred = true;
     }
 
     void updateCps() {
@@ -1589,7 +1641,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                 bool fire = pressNow ? (i == 0) : (i == pressFrame);
                 sim::step(s, f->vx, fire);
                 CCPoint p{s.x, s.y};
-                if ((i % 2) == 0 || s.dead) {
+                {
                     f->traj->drawSegment(prev, p, 1.4f, col);
                     prev = p;
                 }
@@ -1623,7 +1675,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                     f->traj->drawSegment({p.x + h, p.y + h}, {p.x - h, p.y + h}, 1.f, col);
                     f->traj->drawSegment({p.x - h, p.y + h}, {p.x - h, p.y - h}, 1.f, col);
                 }
-                if ((i % 2) == 0 || q.dead) {
+                {
                     f->traj->drawSegment(prev, p, 1.4f, col);
                     prev = p;
                 }
@@ -1640,6 +1692,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         // Plan A = best next press, plan B = best press at least 8 frames away from plan A.
         // Both are simulated and drawn at the same time.
         int previewK = -1, previewK2 = -1;
+        f->previewAge++;
+        if (f->previewAge % 3 == 1 || !f->havePreviewX) {
         {
             std::vector<std::pair<int, int>> cands; // (frames survived, press frame)
             auto w2 = start;
@@ -1667,6 +1721,14 @@ class $modify(BotPlayLayer, PlayLayer) {
             for (auto const& c : cands) {
                 if (previewK >= 0 && std::abs(c.second - previewK) >= 8) { previewK2 = c.second; break; }
             }
+        }
+
+            if (previewK >= 0) { f->cachedPreviewX = start.x + f->vx * previewK; f->havePreviewX = true; }
+            else f->havePreviewX = false;
+        }
+        if (f->havePreviewX) {
+            previewK = static_cast<int>(std::round((f->cachedPreviewX - start.x) / f->vx));
+            if (previewK < 0 || previewK >= HP) previewK = -1;
         }
 
         // Plan A drawn in blue
@@ -1756,7 +1818,7 @@ class $modify(BotPlayLayer, PlayLayer) {
             for (int i = 0; i < H; i++) {
                 waveSim::step(w, f->vx, (i == 0) ? h : s.hold);
                 CCPoint p{w.x, w.y};
-                if ((i % 2) == 0 || w.dead) {
+                {
                     f->traj->drawSegment(prev, p, 1.4f, col);
                     prev = p;
                 }
@@ -1791,58 +1853,13 @@ class $modify(BotPlayLayer, PlayLayer) {
         waveSim::plan(s, f->vx, H, opt);
 
         f->lastPredDeath = !opt[0].alive && !opt[1].alive;
-        if (f->lastPredDeath) {
-            this->addMarker(s.x, s.y, 1);
-            return; // nothing survives, keep current input
-        }
+        if (f->lastPredDeath) this->addMarker(s.x, s.y, 1);
 
-        // Replay the best previous attempt's toggles while they still line up
-        if (f->replayActive) {
-            if (f->replayIdx >= f->bestPresses.size()) {
-                f->replayActive = false;
-            } else {
-                float rx = f->bestPresses[f->replayIdx];
-                if (s.x > rx + 4.f * f->vx) {
-                    f->replayActive = false;
-                } else {
-                    if (s.x >= rx) {
-                        // Only replay a toggle the wave sim says is safe; otherwise let the planner decide
-                        // Check the toggle against the full wave look-ahead, not just one frame
-                        waveSim::Option o[2];
-                        waveSim::plan(s, f->vx, H, o);
-                        int newIdx = f->botHolding ? 0 : 1;
-                        bool safe = o[newIdx].alive && o[newIdx].depth >= H;
-                        if (safe) {
-                            f->botHolding = !f->botHolding;
-                            f->curPresses.push_back(s.x);
-                            this->pressJump(f->botHolding);
-                            f->replayIdx++;
-                        } else {
-                            f->replayActive = false;
-                            f->replayResumeX = s.x + 60.f;
-                        }
-                    }
-                    return;
-                }
-            }
-        }
-
+        // Only trajectory decides: hold if the hold trajectory scores higher, otherwise release
         bool cur = f->botHolding;
-        int curIdx = cur ? 1 : 0;
-        int otherIdx = 1 - curIdx;
-        // Keep the current input unless the other trajectory is clearly better,
-        // or the current one dies while the other survives. Stops rapid clicking.
-        bool want = cur;
-        if (!opt[curIdx].alive && opt[otherIdx].alive) {
-            want = !cur;
-        } else if (opt[otherIdx].alive &&
-                   opt[otherIdx].score() > opt[curIdx].score() + waveSim::SWITCH_MARGIN) {
-            want = !cur;
-        }
-
+        bool want = opt[1].score() > opt[0].score();
         if (want != cur) {
             f->botHolding = want;
-            f->curPresses.push_back(s.x);
             this->pressJump(want);
         }
     }
@@ -1865,7 +1882,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (f->cooldown > 0) f->cooldown--;
 
         if (!this->cubeMode() || (sim::boxes.empty() && sim::wide.empty())) return;
-        if (f->botHolding) return;
+        // No waiting after a press: decide every tick so back-to-back presses (orb chains) are instant
 
         float vx = f->vx;
         int H = sim::horizon(vx);
@@ -1877,7 +1894,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->lastPredDeath = false;
         if (dNo < 0) return; // nothing ahead, don't press
 
-        // Every frame where the cube can press, scored by how long it survives
+        // Every frame where the cube can press, scored by how long its trajectory survives
         std::vector<std::pair<int, int>> cands; // (frames survived, press frame)
         auto w = s;
         for (int k = 0; k <= H; k++) {
@@ -1893,52 +1910,19 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
         std::stable_sort(cands.begin(), cands.end(),
                          [](std::pair<int, int> const& x, std::pair<int, int> const& y) {
-                             // Best survival first; on a tie take the LATER press, so the bot
-                             // doesn't jump early when waiting also survives (orbs, pads)
+                             // Best survival first; on a tie the later press (waiting also survives)
                              return x.first > y.first || (x.first == y.first && x.second > y.second);
                          });
-        int aK = -1, aScore = 0, bK = -1; // plan A = best, plan B = best at least 8 frames away
 
-        if (!cands.empty()) {
-            aScore = cands[0].first;
-            aK = cands[0].second;
-            for (auto const& c : cands) {
-                if (std::abs(c.second - aK) >= 8) { bK = c.second; break; }
-            }
-        }
-
-        // Keep the committed press point while it still survives; if it fails, switch to plan B
-        // Passed the committed press point: drop it now and re-plan this frame, instead of
-        // holding a press that can no longer fire (that was the late-click bug)
-        if (f->hasCommit && std::round((f->commitX - s.x) / vx) < 0) f->hasCommit = false;
-        if (f->hasCommit) {
-            int kc = static_cast<int>(std::round((f->commitX - s.x) / vx));
-            auto w2 = s;
-            bool ok = true;
-            for (int i = 0; i < kc && ok; i++) {
-                sim::step(w2, vx, false);
-                if (w2.dead) ok = false;
-            }
-            if (ok) {
-                sim::step(w2, vx, true);
-                int depth = w2.dead ? 0 : sim::deathFrame(w2, vx, H);
-                if (depth < 0) depth = H;
-                ok = !w2.dead && depth >= aScore - 10;
-            }
-            if (!ok) f->hasCommit = false; // re-pick the single best path below
-        }
-        if (!f->hasCommit && aK >= 0) {
-            f->commitX = s.x + vx * aK;
-            f->hasCommit = true;
-        }
-        f->lastPredDeath = aScore < H; // even the best trajectory hits something
-        if (!f->hasCommit) {
-            this->addMarker(s.x, s.y, 1); // no press survives longer than not pressing
+        if (cands.empty()) {
+            f->lastPredDeath = true;
+            this->addMarker(s.x, s.y, 1); // no press beats doing nothing
             return;
         }
+        f->lastPredDeath = cands[0].first < H; // even the best trajectory hits something
 
-        int kNow = static_cast<int>(std::round((f->commitX - s.x) / vx));
-        if (kNow == 0 && act) this->botPress(s); // committed press is now
+        // The best trajectory presses now: press. Otherwise wait for its press frame.
+        if (cands[0].second == 0 && act) this->botPress(s);
     }
 
     void applyLayoutMode(bool enable) {
