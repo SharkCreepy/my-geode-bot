@@ -28,7 +28,7 @@ constexpr bool ENABLE_CALIBRATION = false;
 constexpr float MAX_LEARNED_MARGIN = 2.f;
 // Replay the best earlier attempt's presses. Stops only just before a known death,
 // lets the planner fix that spot, then resumes the rest of the recorded path.
-constexpr bool ENABLE_REPLAY = true;
+constexpr bool ENABLE_REPLAY = false;
 
 struct State {
     bool layout = false;
@@ -1024,7 +1024,6 @@ class $modify(BotPlayLayer, PlayLayer) {
             m_fields->deathXs.push_back(player->getPositionX());
             int t = m_fields->lastPredDeath ? 0 : 2;
             this->addMarker(player->getPositionX(), player->getPositionY(), t);
-            if (t == 2) m_fields->learnedMargin = std::min(m_fields->learnedMargin + 0.5f, MAX_LEARNED_MARGIN);
             m_fields->runs.push_back(Run{m_fields->curPresses, m_fields->maxX});
             std::sort(m_fields->runs.begin(), m_fields->runs.end(),
                       [](Run const& a, Run const& b) { return a.progress > b.progress; });
@@ -1232,8 +1231,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (f->haveLast && frames60 > 0.f) {
             float dx = (x - f->lastX) / frames60;
             float dy = (y - f->lastY) / frames60;
-            if (dx > 0.5f && dx < 20.f) f->vx = dx;
-            f->vy = std::clamp(dy, -30.f, 30.f);
+            if (dx > 0.5f && dx < 20.f) f->vx = 0.9f * f->vx + 0.1f * dx;
+            f->vy = 0.8f * f->vy + 0.2f * std::clamp(dy, -30.f, 30.f);
         }
         f->lastX = x;
         f->lastY = y;
@@ -1544,7 +1543,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                     if (depth < 0) depth = HP;
                     bool orb = !j.dead && j.lock >= 0 && j.lock < (int)sim::boxes.size() &&
                                sim::isOrb(sim::boxes[j.lock].kind);
-                    int score = depth + (orb ? 40 : 0);
+                    int score = depth;
                     if (score > bestScore) { bestScore = score; previewK = i; }
                 }
                 sim::step(w2, f->vx, false);
@@ -1922,9 +1921,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         float aimX = 0.f, lastX = 0.f;
         // First try with extra clearance around hazards, then fall back to exact hitboxes
-        bool ok = findWindow(f->learnedMargin + 3.f, aimX, lastX)
-               || findWindow(f->learnedMargin, aimX, lastX)
-               || findWindow(0.f, aimX, lastX);
+        bool ok = findWindow(3.f, aimX, lastX) || findWindow(0.f, aimX, lastX);
 
         if (!ok) {
             // Far-away deaths are not urgent: keep waiting instead of jumping early
@@ -1953,7 +1950,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                     bool orb = !j.dead && j.lock >= 0 && j.lock < (int)sim::boxes.size() &&
                                sim::isOrb(sim::boxes[j.lock].kind);
                     if (orb) f->orbSeen = true;
-                    int score = depth + (orb ? 40 : 0);
+                    int score = depth;
                     if (score > bestScore || (bestK >= 0 && score == bestScore)) {
                         bestScore = score;
                         bestDepth = depth;
@@ -1963,10 +1960,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                 sim::step(w, vx, false);
                 if (w.dead) break;
             }
-            if (bestK < 0) {
-                if (act && d <= 6) this->botPress(s, 6); // nothing helps, last-ditch jump
-                return;
-            }
+            if (bestK < 0) return;
             aimX = s.x + vx * bestK;
             lastX = aimX;
             f->planFirstX = aimX;
@@ -1993,7 +1987,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                             // Prefer a route that uses an orb (a different route), then the nearest
                             bool orb = jb.lock >= 0 && jb.lock < (int)sim::boxes.size() &&
                                        sim::isOrb(sim::boxes[jb.lock].kind);
-                            float sc = (orb ? 40.f : 0.f) - dist / vx;
+                            float sc = -dist / vx;
                             if (sc > bestScore) {
                                 bestScore = sc;
                                 f->planBX = px;
