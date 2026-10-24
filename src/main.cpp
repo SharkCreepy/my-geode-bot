@@ -1531,9 +1531,11 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         // Preview: if no plan is committed yet, find the best next press anyway (same scoring
         // as the fallback: survival plus a bonus for orbs), so the next jump/orb always shows.
-        int previewK = -1;
-        if (g.bot && !f->havePlan) {
-            int bestScore = -1;
+        // Plan A = best next press, plan B = best press at least 8 frames away from plan A.
+        // Both are simulated and drawn at the same time.
+        int previewK = -1, previewK2 = -1;
+        {
+            std::vector<std::pair<int, int>> cands; // (frames survived, press frame)
             auto w2 = start;
             for (int i = 0; i < HP; i++) {
                 if (sim::canAct(w2)) {
@@ -1541,22 +1543,42 @@ class $modify(BotPlayLayer, PlayLayer) {
                     sim::step(j, f->vx, true);
                     int depth = j.dead ? 0 : sim::deathFrame(j, f->vx, HP);
                     if (depth < 0) depth = HP;
-                    bool orb = !j.dead && j.lock >= 0 && j.lock < (int)sim::boxes.size() &&
-                               sim::isOrb(sim::boxes[j.lock].kind);
-                    int score = depth;
-                    if (score > bestScore) { bestScore = score; previewK = i; }
+                    cands.push_back({depth, i});
                 }
                 sim::step(w2, f->vx, false);
                 if (w2.dead) break;
             }
+            std::stable_sort(cands.begin(), cands.end(),
+                             [](std::pair<int, int> const& x, std::pair<int, int> const& y) {
+                                 return x.first > y.first;
+                             });
+            if (!cands.empty()) previewK = cands[0].second;
+            for (auto const& c : cands) {
+                if (previewK >= 0 && std::abs(c.second - previewK) >= 8) { previewK2 = c.second; break; }
+            }
         }
 
-        int planFrame = -1;
-        if (g.bot && f->havePlan) {
-            planFrame = static_cast<int>(std::round((f->planX - start.x) / f->vx));
-        } else if (g.bot) {
-            planFrame = previewK;
+        // Plan B drawn in purple, with its own second press
+        if (previewK2 >= 0) {
+            std::vector<int> pr{previewK2};
+            auto ww = start;
+            for (int i = 0; i < HP; i++) {
+                if (i > previewK2 && sim::canAct(ww)) {
+                    auto jj = ww;
+                    sim::step(jj, f->vx, true);
+                    if (!jj.dead && sim::deathFrame(jj, f->vx, HP - i - 1) < 0) {
+                        pr.push_back(i);
+                        break;
+                    }
+                }
+                sim::step(ww, f->vx, i == previewK2);
+                if (ww.dead) break;
+            }
+            drawPresses(pr, ccc4f(0.8f, 0.4f, 1.f, 0.9f));
         }
+
+        // Plan A drawn in blue
+        int planFrame = previewK;
         {
             if (planFrame >= 0) {
                 planFrame = std::min(planFrame, HP - 1);
@@ -1714,18 +1736,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
 
         bool cur = f->botHolding;
-        int curIdx = cur ? 1 : 0;
-        int otherIdx = 1 - curIdx;
-
-        // Keep the current input unless the other one is clearly better,
-        // or the current one dies while the other survives.
-        bool want = cur;
-        if (!opt[curIdx].alive && opt[otherIdx].alive) {
-            want = !cur;
-        } else if (opt[otherIdx].alive &&
-                   opt[otherIdx].score() > opt[curIdx].score() + waveSim::SWITCH_MARGIN) {
-            want = !cur;
-        }
+        // Hold or release, whichever trajectory scores higher this frame
+        bool want = opt[1].score() > opt[0].score();
 
         if (want != cur) {
             f->botHolding = want;
@@ -1759,253 +1771,36 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto s = this->currentSimState();
         bool act = sim::canAct(s);
 
-        int d = sim::deathFrame(s, vx, H);
-        f->lastPredDeath = d >= 0;
+        // How long the cube survives if it never presses again
+        int dNo = sim::deathFrame(s, vx, H);
+        f->lastPredDeath = dNo >= 0;
+        if (dNo < 0) return; // nothing ahead, don't press
 
-        // Follow the best previous attempt's presses. Stop just before a known death,
-        // let the planner fix that spot, then resume the recorded path after it.
-        if (f->replayActive) {
-            if (f->replayIdx >= f->bestPresses.size()) {
-                f->replayActive = false;
-            } else {
-                float rx = f->bestPresses[f->replayIdx];
-                float dx = this->nextDeathAhead(rx);
-                if (dx > -1e8f) {
-                    f->replayActive = false;
-                    f->replayResumeX = dx + 30.f;
-                } else if (s.x > rx + 4.f * vx || (d >= 0 && d <= 2)) {
-                    f->replayActive = false;
-                    f->replayResumeX = s.x + 60.f;
-                } else {
-                    if (act && s.x + vx * 0.5f >= rx) {
-                        // Only replay a press the sim agrees with: it must survive longer than not pressing
-                        auto j = s;
-                        sim::step(j, vx, true);
-                        int dj = j.dead ? 0 : sim::deathFrame(j, vx, H);
-                        bool safe = !j.dead && (dj < 0 || dj > d);
-                        if (safe || d > 40) {
-                            this->botPress(s);
-                            f->replayIdx++;
-                        } else {
-                            // Recorded press is unsafe: look for a safe press from another recorded run
-                            float alt = 0.f;
-                            f->replayActive = false;
-                            if (this->scanRecordedOption(s, vx, H, alt)) {
-                                f->havePlan = true;
-                                f->planX = alt;
-                                f->planFirstX = alt;
-                                f->planDeadlineX = alt + vx * 2.f;
-                                f->planIdle = 0;
-                                f->planAge = 0;
-                            } else {
-                                f->replayResumeX = s.x + 60.f;
-                            }
-                        }
-                    }
-                    return;
+        // Try pressing at every frame where the cube can press (ground or inside an orb),
+        // and keep the frame whose trajectory survives longest. Earliest frame wins ties.
+        int bestK = -1;
+        int bestScore = dNo;
+        auto w = s;
+        for (int k = 0; k <= H; k++) {
+            if (sim::canAct(w)) {
+                auto j = w;
+                sim::step(j, vx, true);
+                int depth = j.dead ? 0 : sim::deathFrame(j, vx, H);
+                if (depth < 0) depth = H;
+                if (depth > bestScore) {
+                    bestScore = depth;
+                    bestK = k;
                 }
             }
-        }
-        // Resume the recorded path once we are past the fixed spot
-        if (!f->replayActive && ENABLE_REPLAY && f->replayResumeX > -1e8f && s.x > f->replayResumeX) {
-            f->replayResumeX = -1e9f;
-            size_t i = 0;
-            while (i < f->bestPresses.size() && f->bestPresses[i] <= s.x) i++;
-            f->replayIdx = i;
-            f->replayActive = i < f->bestPresses.size();
-        }
-        if (d < 0 && !f->havePlan) return; // nothing to avoid, and no plan to keep
-
-        // Commit to the plan that is drawn on screen. Only drop it if the window was missed,
-        // so the bot actually follows the blue path instead of replanning past the press point.
-        if (f->havePlan) {
-            int pf = static_cast<int>(std::round((f->planX - s.x) / vx));
-            bool missed = s.x > f->planDeadlineX + vx * 2.f;
-            // Check plan A against the sim from here: does pressing at its planned frame still survive?
-            bool aFails = false;
-            if (!missed && pf >= 0) {
-                sim::S w = s;
-                for (int i = 0; i < H && !aFails; i++) {
-                    sim::step(w, vx, i == pf);
-                    if (w.dead) aFails = true;
-                }
-            }
-            if ((missed || aFails) && f->hasPlanB && f->planBX > s.x) {
-                // Plan A failed: switch to plan B
-                f->planX = f->planBX;
-                f->planFirstX = f->planBX;
-                f->planDeadlineX = f->planBX + vx * 2.f;
-                f->hasPlanB = false;
-                f->planAge = 0;
-                return;
-            }
-            if (missed || aFails) {
-                f->havePlan = false; // no backup left: replan from here
-            } else {
-                // On the ground press at the planned spot. In the air (orbs), press on the first
-                // frame the orb is reachable inside the planned window.
-                // In the air, look 1.5 frames ahead to cover input lag (the game applies a press a
-                // frame or so after it is sent), so orb presses land on the planned frame, not after it.
-                bool inWindow = s.ground ? (s.x + vx * 0.5f >= f->planX)
-                                         : (s.x + vx * 1.5f >= f->planFirstX);
-                if (act && inWindow) {
-                    // Per-frame trajectory check: press now only if pressing now survives at least as
-                    // long as pressing one frame later. Otherwise wait for the better frame.
-                    int H2 = sim::horizon(vx);
-                    sim::S now = s;
-                    sim::step(now, vx, true);
-                    int dNow = now.dead ? 0 : sim::deathFrame(now, vx, H2);
-                    if (dNow < 0) dNow = H2;
-                    sim::S later = s;
-                    sim::step(later, vx, false);
-                    bool laterOk = !later.dead && sim::canAct(later);
-                    int dLater = 0;
-                    if (laterOk) {
-                        sim::step(later, vx, true);
-                        dLater = later.dead ? 0 : sim::deathFrame(later, vx, H2);
-                        if (dLater < 0) dLater = H2;
-                    }
-                    if (!laterOk || dNow >= dLater) this->botPress(s);
-                }
-                return;
-            }
-        }
-        if (f->cooldown > 0) return;
-        // Nothing close enough to hit: don't plan or press yet. Only react to a real threat.
-        if (d > 40 && !this->deathAhead(s.x, 250.f)) return;
-
-        // Find the widest window of frames where a press survives.
-        auto findWindow = [&](float margin, float& aimX, float& lastX) -> bool {
-            sim::hazMargin = margin;
-            struct Reset { ~Reset() { sim::hazMargin = 0.f; } } reset;
-
-            int dm = sim::deathFrame(s, vx, H);
-            if (dm < 0) return false;
-
-            sim::Planner p;
-            p.vx = vx;
-            p.H = H;
-
-            for (int extra : {0, 2}) { // 0 = one press is enough, 2 = allow follow-up presses
-                int bestFirst = -1, bestLast = -1, runFirst = -1;
-                auto w = s;
-                for (int k = 0; k <= dm; k++) {
-                    if (!sim::canAct(w) || this->nearPastDeath(s.x + vx * k)) {
-                        runFirst = -1;
-                    } else if (extra == 0 || (k & 1) == 0) {
-                        auto j = w;
-                        sim::step(j, vx, true);
-                        p.budget = extra == 0 ? 3000 : 5000;
-                        if (!j.dead && p.survive(j, 1, extra)) {
-                            if (runFirst < 0) runFirst = k;
-                            if (bestFirst < 0 || (k - runFirst) >= (bestLast - bestFirst)) {
-                                bestFirst = runFirst;
-                                bestLast = k;
-                            }
-                        } else {
-                            runFirst = -1;
-                        }
-                    }
-                    sim::step(w, vx, false);
-                    if (w.dead) break;
-                }
-                if (bestFirst >= 0) {
-                    m_fields.self()->planFirstX = s.x + vx * bestFirst;
-                    aimX = s.x + vx * (bestFirst + (bestLast - bestFirst) * 0.5f);
-                    lastX = s.x + vx * bestLast;
-                    return true;
-                }
-            }
-            return false;
-        };
-
-        float aimX = 0.f, lastX = 0.f;
-        // First try with extra clearance around hazards, then fall back to exact hitboxes
-        bool ok = findWindow(3.f, aimX, lastX) || findWindow(0.f, aimX, lastX);
-
-        if (!ok) {
-            // Far-away deaths are not urgent: keep waiting instead of jumping early
-            if (d > 30) return;
-            // Pads launch the cube by themselves, so don't add a jump on top of one
-            bool onPad = false;
-            sim::forEachNear(s.x, [&](sim::Box const& b) {
-                if (sim::isPad(b.kind) && sim::overlap(s.x, s.y, sim::ORB_HALF, b)) onPad = true;
-            });
-            if (onPad) return;
-
-            this->addMarker(s.x, s.y, 1);
-            // No jump clears everything in the look-ahead. Instead of waiting until death is
-            // imminent, take the press frame that survives longest (better than doing nothing).
-            int bestK = -1, bestDepth = d;
-            int bestScore = d;
-            f->orbSeen = false;
-            auto w = s;
-            for (int k = 0; k <= d; k++) {
-                if (sim::canAct(w) && !this->nearPastDeath(s.x + vx * k)) {
-                    auto j = w;
-                    sim::step(j, vx, true);
-                    int depth = j.dead ? 0 : sim::deathFrame(j, vx, H);
-                    if (depth < 0) depth = H; // survives the whole horizon
-                    // Orb presses get a bonus: they change direction and clear obstacles
-                    bool orb = !j.dead && j.lock >= 0 && j.lock < (int)sim::boxes.size() &&
-                               sim::isOrb(sim::boxes[j.lock].kind);
-                    if (orb) f->orbSeen = true;
-                    int score = depth;
-                    if (score > bestScore || (bestK >= 0 && score == bestScore)) {
-                        bestScore = score;
-                        bestDepth = depth;
-                        bestK = k;
-                    }
-                }
-                sim::step(w, vx, false);
-                if (w.dead) break;
-            }
-            if (bestK < 0) return;
-            aimX = s.x + vx * bestK;
-            lastX = aimX;
-            f->planFirstX = aimX;
+            sim::step(w, vx, false);
+            if (w.dead) break;
         }
 
-        if (act && s.x + vx * 0.5f >= aimX) {
-            this->botPress(s);
+        if (bestK < 0) {
+            this->addMarker(s.x, s.y, 1); // nothing survives longer than not pressing
             return;
         }
-
-        // Plan B: another press that survives the look-ahead, at least 8 frames away from plan A
-        f->hasPlanB = false;
-        {
-            float bestScore = -1e9f;
-            auto wb = s;
-            for (int k = 0; k <= std::min(d, 60); k++) {
-                if (sim::canAct(wb)) {
-                    float px = s.x + vx * k;
-                    float dist = std::abs(px - aimX);
-                    if (dist >= 8.f * vx) {
-                        auto jb = wb;
-                        sim::step(jb, vx, true);
-                        if (!jb.dead && sim::deathFrame(jb, vx, H) < 0) {
-                            // Prefer a route that uses an orb (a different route), then the nearest
-                            bool orb = jb.lock >= 0 && jb.lock < (int)sim::boxes.size() &&
-                                       sim::isOrb(sim::boxes[jb.lock].kind);
-                            float sc = -dist / vx;
-                            if (sc > bestScore) {
-                                bestScore = sc;
-                                f->planBX = px;
-                                f->hasPlanB = true;
-                            }
-                        }
-                    }
-                }
-                sim::step(wb, vx, false);
-                if (wb.dead) break;
-            }
-        }
-        f->havePlan = true;
-        f->planX = aimX;
-        f->planDeadlineX = lastX + vx * 0.5f;
-        f->planIdle = 0;
-        f->planAge = 0;
-        f->trajDirty = true;
+        if (bestK == 0 && act) this->botPress(s); // best frame is now
     }
 
     void applyLayoutMode(bool enable) {
