@@ -777,6 +777,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         float planFirstX = 0.f;
         bool hasPlanB = false; // backup press (plan B) for the committed plan (plan A)
         float planBX = 0.f;
+        bool hasCommit = false; // the press point the bot is currently committed to
+        float commitX = 0.f;
         float replayResumeX = -1e9f;
         bool orbSeen = false; // an orb press was among the fallback options this tick
         int planIdle = 0;
@@ -1517,6 +1519,14 @@ class $modify(BotPlayLayer, PlayLayer) {
                 bool fire = std::find(presses.begin(), presses.end(), i) != presses.end();
                 sim::step(q, f->vx, fire);
                 CCPoint p{q.x, q.y};
+                if (fire) {
+                    // Draw the cube's 2D hitbox at each press point
+                    float h = sim::HALF;
+                    f->traj->drawSegment({p.x - h, p.y - h}, {p.x + h, p.y - h}, 1.f, col);
+                    f->traj->drawSegment({p.x + h, p.y - h}, {p.x + h, p.y + h}, 1.f, col);
+                    f->traj->drawSegment({p.x + h, p.y + h}, {p.x - h, p.y + h}, 1.f, col);
+                    f->traj->drawSegment({p.x - h, p.y + h}, {p.x - h, p.y - h}, 1.f, col);
+                }
                 if ((i % 2) == 0 || q.dead) {
                     f->traj->drawSegment(prev, p, 1.4f, col);
                     prev = p;
@@ -1776,10 +1786,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         f->lastPredDeath = dNo >= 0;
         if (dNo < 0) return; // nothing ahead, don't press
 
-        // Try pressing at every frame where the cube can press (ground or inside an orb),
-        // and keep the frame whose trajectory survives longest. Earliest frame wins ties.
-        int bestK = -1;
-        int bestScore = dNo;
+        // Every frame where the cube can press, scored by how long it survives
+        std::vector<std::pair<int, int>> cands; // (frames survived, press frame)
         auto w = s;
         for (int k = 0; k <= H; k++) {
             if (sim::canAct(w)) {
@@ -1787,20 +1795,56 @@ class $modify(BotPlayLayer, PlayLayer) {
                 sim::step(j, vx, true);
                 int depth = j.dead ? 0 : sim::deathFrame(j, vx, H);
                 if (depth < 0) depth = H;
-                if (depth > bestScore) {
-                    bestScore = depth;
-                    bestK = k;
-                }
+                if (depth > dNo) cands.push_back({depth, k});
             }
             sim::step(w, vx, false);
             if (w.dead) break;
         }
+        std::stable_sort(cands.begin(), cands.end(),
+                         [](std::pair<int, int> const& x, std::pair<int, int> const& y) {
+                             return x.first > y.first;
+                         });
+        int aK = -1, aScore = 0, bK = -1; // plan A = best, plan B = best at least 8 frames away
+        if (!cands.empty()) {
+            aScore = cands[0].first;
+            aK = cands[0].second;
+            for (auto const& c : cands) {
+                if (std::abs(c.second - aK) >= 8) { bK = c.second; break; }
+            }
+        }
 
-        if (bestK < 0) {
-            this->addMarker(s.x, s.y, 1); // nothing survives longer than not pressing
+        // Keep the committed press point while it still survives; if it fails, switch to plan B
+        if (f->hasCommit && f->commitX < s.x - vx) f->hasCommit = false; // already passed it
+        if (f->hasCommit) {
+            int kc = static_cast<int>(std::round((f->commitX - s.x) / vx));
+            auto w2 = s;
+            bool ok = true;
+            for (int i = 0; i < kc && ok; i++) {
+                sim::step(w2, vx, false);
+                if (w2.dead) ok = false;
+            }
+            if (ok) {
+                sim::step(w2, vx, true);
+                int depth = w2.dead ? 0 : sim::deathFrame(w2, vx, H);
+                if (depth < 0) depth = H;
+                ok = !w2.dead && depth >= aScore - 10;
+            }
+            if (!ok) {
+                if (bK >= 0) f->commitX = s.x + vx * bK; // switch to plan B
+                else f->hasCommit = false;
+            }
+        }
+        if (!f->hasCommit && aK >= 0) {
+            f->commitX = s.x + vx * aK;
+            f->hasCommit = true;
+        }
+        if (!f->hasCommit) {
+            this->addMarker(s.x, s.y, 1); // no press survives longer than not pressing
             return;
         }
-        if (bestK == 0 && act) this->botPress(s); // best frame is now
+
+        int kNow = static_cast<int>(std::round((f->commitX - s.x) / vx));
+        if (kNow == 0 && act) this->botPress(s); // committed press is now
     }
 
     void applyLayoutMode(bool enable) {
